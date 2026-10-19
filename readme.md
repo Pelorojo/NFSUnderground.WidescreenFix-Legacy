@@ -14,9 +14,14 @@ This version stays with the 2023 code base and focuses on:
 
 ## Status
 
-- North America and EU: work, unchanged from the 2023 version.
-- Russian SoftClub release: not done yet. A few of the code patterns the fix looks for are different in this
-  release; adapting them is the next step.
+- North America and EU: work, same behavior as the 2023 version.
+- Russian SoftClub release: works, including the windowed modes (this release reads the window size from the
+  wrong place; the fix corrects that), SkipIntro and the HUD. Not available there yet:
+  - `ShowLangSelect`: the game's own language menu is broken in this release, so the option is ignored
+  - `HideDebugObjects = 2` (pillarboxing): falls back to 1
+  - `BlackMagazineFix`: ignored
+  - `ImproveGamepadSupport`: works (button icons, front-end actions), but the controls setup keeps the raw
+    DirectInput names ("Button 0" instead of "A")
 
 It is a drop-in replacement: same file names (`scripts\NFSUnderground.WidescreenFix.asi` / `.ini` / `.dat`),
 existing settings keep working.

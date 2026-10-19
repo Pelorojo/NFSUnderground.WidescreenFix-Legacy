@@ -414,6 +414,18 @@ void Init()
             injector::WriteMemory<float>(pattern.get_first(4), (Screen.fHudPosX - 320.0f) + 440.0f, true);
             injector::WriteMemory<float>(pattern.get_first(64), (Screen.fHudPosX - 320.0f) + 440.0f, true);
         }
+        else
+        {
+            // Russian SoftClub exe: same values, but stored with 32-bit stack offsets, so the immediates are further apart
+            pattern = hook::pattern("C7 44 24 ? 00 00 DC 43 C7 84 24 ? 00 00 00 00 00 70 41");
+            if (!pattern.empty())
+            {
+                injector::WriteMemory<float>(pattern.get_first(26), (Screen.fHudPosX - 320.0f) + 200.0f, true);
+                injector::WriteMemory<float>(pattern.get_first(48), (Screen.fHudPosX - 320.0f) + 200.0f, true);
+                injector::WriteMemory<float>(pattern.get_first(4), (Screen.fHudPosX - 320.0f) + 440.0f, true);
+                injector::WriteMemory<float>(pattern.get_first(70), (Screen.fHudPosX - 320.0f) + 440.0f, true);
+            }
+        }
 
         //pattern = hook::pattern("8D 72 04 83 C0 60 E8 ? ? ? ? 5F 5E C3"); //menu (#179)
         //if (pattern.size() > 0)
@@ -677,6 +689,11 @@ void Init()
         }
     }
 
+    // The Russian SoftClub release can't use the language selection (empty language names, garbled text, crash when
+    // choosing); recognized by its "LANGUAGES\RUSSIAN.BIN" string
+    if (bShowLangSelect && !hook::pattern("4C 41 4E 47 55 41 47 45 53 5C 52 55 53 53 49 41 4E 2E 42 49 4E").empty())
+        bShowLangSelect = false;
+
     if (bSkipIntro)
     {
         // patch bootflow
@@ -695,7 +712,7 @@ void Init()
         }
 
         uintptr_t loc_4DE21A = reinterpret_cast<uintptr_t>(hook::pattern("89 36 89 76 04 A1 ? ? ? ? 83 F8 05").get_first(0)) + 0x15;
-        uintptr_t loc_4DE273 = loc_4DE21A + 0x59;
+        uintptr_t loc_4DE273 = loc_4DE21A + 2 + *reinterpret_cast<int8_t*>(loc_4DE21A + 1); // target of the je there (+0x59 in NA/EU, +0x58 in the Russian SoftClub exe)
         uintptr_t loc_4DE2A0 = reinterpret_cast<uintptr_t>(hook::pattern("8B 4E 04 89 01 83 C7 04 81 FF ? ? ? ? 89 46 04 89 48 04 89 30 7C C8 8B 36").get_first(0)) + 8;
 
         // force US Retail bootflow
@@ -723,7 +740,7 @@ void Init()
         static const char* BootFlowScreensLangSelect[] = { "LS_LangSelect.fng", "LS_EAlogo.fng", "LS_PSAMovie.fng", "LS_IntroFMV.fng", "LS_Splash_PC.fng", "MU_UG_NEwOrLoad_PC2.fng" , "BootFlowEnd" };
         
         uintptr_t loc_4DE21A = reinterpret_cast<uintptr_t>(hook::pattern("89 36 89 76 04 A1 ? ? ? ? 83 F8 05").get_first(0)) + 0x15;
-        uintptr_t loc_4DE273 = loc_4DE21A + 0x59;
+        uintptr_t loc_4DE273 = loc_4DE21A + 2 + *reinterpret_cast<int8_t*>(loc_4DE21A + 1); // target of the je there (+0x59 in NA/EU, +0x58 in the Russian SoftClub exe)
         uintptr_t loc_4DE2A0 = reinterpret_cast<uintptr_t>(hook::pattern("8B 4E 04 89 01 83 C7 04 81 FF ? ? ? ? 89 46 04 89 48 04 89 30 7C C8 8B 36").get_first(0)) + 8;
 
         // force US Retail bootflow
@@ -968,6 +985,10 @@ void Init()
         }; injector::MakeInline<DeadzoneHook>(pattern.get_first(-2), pattern.get_first(4));
     }
 
+    // Pillarboxing needs the EndScene spot, which isn't there in the Russian SoftClub exe; remove the objects instead
+    if (nHideDebugObjects == 2 && hook::pattern("A1 ? ? ? ? 8B 08 83 C4 04 50").empty())
+        nHideDebugObjects = 1;
+
     if (nHideDebugObjects)
     {
         if (nHideDebugObjects == 2)
@@ -1004,6 +1025,10 @@ void Init()
             injector::MakeJMP(pattern.get_first(-4), FEPkgMgr_SendMessageToPackage_Cave, true);
         }
     }
+
+    // Not available in the Russian SoftClub exe (the background render spot differs)
+    if (bBlackMagazineFix && (hook::pattern("8B F8 A0 ? ? ? ? 84 C0 0F 85").empty() || hook::pattern("83 3D ? ? ? ? 01 8B 77 58").empty() || hook::pattern("6A 00 BE ? ? ? ? 74 ? BE").empty()))
+        bBlackMagazineFix = false;
 
     if (bBlackMagazineFix)
     {
@@ -1107,6 +1132,15 @@ void Init()
         injector::MakeCALL(dword_408975, WindowedModeWrapper::AdjustWindowRect_Hook, true);
         // enable windowed mode variable
         *WindowedMode_73637C = 1;
+
+        // The Russian SoftClub exe moved ResX/ResY, but its window creation still reads them from the old place
+        // (garbage size there); point it to the ones the rest of the game uses
+        pattern = hook::pattern("8B 0D ? ? ? ? 8B 15 ? ? ? ? B8 64 00 00 00 53 03 C8 03 D0");
+        if (!pattern.empty() && *pattern.get_first<uint32_t*>(2) != dword_701034)
+        {
+            injector::WriteMemory(pattern.get_first(2), dword_701034, true);
+            injector::WriteMemory(pattern.get_first(8), dword_701038, true);
+        }
 
         switch (nWindowedMode)
         {
