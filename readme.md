@@ -34,7 +34,10 @@ existing settings keep working.
 
 ## Building
 
-Requires Visual Studio 2022 (C++ desktop workload) on Windows.
+Requires Visual Studio (2019 or newer, C++ desktop workload) on Windows with the **MSVC v142** (VS 2019) build
+tools. The project is fixed to that toolset because newer ones produce an .asi that doesn't load on Windows 7;
+in Visual Studio 2022/2026 add it via the installer (individual component "MSVC v142 - VS 2019 C++ x64/x86
+build tools").
 
 ```
 git clone --recursive https://github.com/Pelorojo/NFSUnderground.WidescreenFix-Legacy.git

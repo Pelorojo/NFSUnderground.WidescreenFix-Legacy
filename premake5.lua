@@ -14,6 +14,7 @@ workspace "NFSUnderground.WidescreenFix-Legacy"
    targetdir "data/%{prj.name}/scripts"
    targetextension ".asi"
    characterset ("UNICODE")
+   toolset "v142" -- VS 2019 toolset: newer ones drop Windows 7 support
    staticruntime "On"
 
    defines { "rsc_CompanyName=\"ThirteenAG, Pelorojo\"" }
@@ -57,6 +58,10 @@ workspace "NFSUnderground.WidescreenFix-Legacy"
       debugdir (gamepath)
       debugcommand (gamepath .. "speed.exe")
    end
+
+   -- Hooking.Patterns.cpp uses std::string without including <string>; newer MSVC versions no longer pull it in
+   filter "files:external/hooking/Hooking.Patterns.cpp"
+      forceincludes { "string" }
 
    filter "configurations:Debug*"
       defines "DEBUG"
