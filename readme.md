@@ -1,0 +1,50 @@
+# NFSUnderground.WidescreenFix Legacy (EU/SoftClub compatible)
+
+Widescreen fix for **Need for Speed: Underground** (PC, v1.4), based on the NFSU part of
+[ThirteenAG's WidescreenFixesPack](https://github.com/ThirteenAG/WidescreenFixesPack) as of commit
+[`17c4408`](https://github.com/ThirteenAG/WidescreenFixesPack/tree/17c4408) (July 2023).
+
+## Why this version
+
+Newer versions of the original fix were rewritten (2026) and changed the way they hook into the game.
+This version stays with the 2023 code base and focuses on:
+
+- working together with other plugins for NFSU, e.g. the NFSU Lap Recorder
+- the European (EU) and the Russian SoftClub release of the game, in addition to North America
+
+## Status
+
+- North America and EU: work, unchanged from the 2023 version.
+- Russian SoftClub release: not done yet. A few of the code patterns the fix looks for are different in this
+  release; adapting them is the next step.
+
+It is a drop-in replacement: same file names (`scripts\NFSUnderground.WidescreenFix.asi` / `.ini` / `.dat`),
+existing settings keep working.
+
+## Installation
+
+1. Install an ASI loader (e.g. [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)) as `dinput8.dll` in the game folder.
+2. Copy the contents of `data/NFSUnderground.WidescreenFix/` (or the release archive) into the game folder.
+3. Adjust `scripts\NFSUnderground.WidescreenFix.ini` if needed.
+
+## Building
+
+Requires Visual Studio 2022 (C++ desktop workload) on Windows.
+
+```
+git clone --recursive https://github.com/Pelorojo/NFSUnderground.WidescreenFix-Legacy.git
+cd NFSUnderground.WidescreenFix-Legacy
+premake5.bat
+```
+
+Then open `build/NFSUnderground.WidescreenFix-Legacy.sln` and build `Release|Win32`. The .asi ends up in
+`data/NFSUnderground.WidescreenFix/scripts/`. Optionally set the environment variable `GAME_DIR` (game folder,
+with a trailing backslash) before running `premake5.bat` to have the .asi copied into the game's `scripts` folder
+after each build.
+
+## Credits and license
+
+- Original work: [ThirteenAG](https://github.com/ThirteenAG) and the contributors of the WidescreenFixesPack.
+- Libraries (git submodules): Hooking.Patterns, injector, IniReader, spdlog, filewatch, ModUtils, minidx9 – each under its own license.
+
+MIT License, see [license](license). The original copyright notice is kept unchanged.
