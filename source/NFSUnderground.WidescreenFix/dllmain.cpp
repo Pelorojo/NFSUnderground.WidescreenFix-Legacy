@@ -263,6 +263,69 @@ namespace DebugTags
     }
 }
 
+// Clips the frontend to the centered 4:3 area while it draws (like UIScissor in the newer WidescreenFix): what the
+// game puts outside of it, e.g. leftover dev tags on the online login or the neighbor cars' names in the car select,
+// isn't drawn. Only on screens wider than 4:3, not while a movie plays.
+namespace FEClip
+{
+    LPDIRECT3DDEVICE9* pDevice = nullptr;
+    int32_t* pGameState = nullptr;
+    void** pMoviePlayer = nullptr;
+    uint32_t* pStartValue = nullptr;   // What the start spot loads into EAX
+    uint32_t* pRestoreValue = nullptr; // What the second end spot loads into EAX
+    uintptr_t RestoreJmpTarget = 0;    // Where the first end spot's JMP goes
+    uintptr_t DrawCursorTarget = 0;    // The function that draws the mouse cursor (its position from 0x70649C/0x7064A0)
+    bool bActive = false;
+
+    void StartClip()
+    {
+        if (*pGameState != 3 || *pMoviePlayer || !*pDevice || Screen.fHudOffsetReal < 1.0f)
+            return;
+        RECT rect = { static_cast<LONG>(Screen.fHudOffsetReal), 0, static_cast<LONG>(Screen.fHudOffsetReal + Screen.fWidth43), static_cast<LONG>(Screen.nHeight) };
+        (*pDevice)->SetScissorRect(&rect);
+        (*pDevice)->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+        bActive = true;
+    }
+
+    void __cdecl StopClip()
+    {
+        if (!bActive)
+            return;
+        bActive = false;
+        if (*pDevice)
+            (*pDevice)->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    }
+
+    // The first end spot is a JMP: end the clipping, then take that JMP
+    void __declspec(naked) RestoreJmpCave()
+    {
+        _asm
+        {
+            pushfd
+            pushad
+            call StopClip
+            popad
+            popfd
+            jmp RestoreJmpTarget
+        }
+    }
+
+    // The mouse cursor is drawn right after the packages: end the clipping before it, so it shows on the whole
+    // screen. Called instead of the cursor function, the stack and all registers are passed on unchanged.
+    void __declspec(naked) DrawCursorCave()
+    {
+        _asm
+        {
+            pushfd
+            pushad
+            call StopClip
+            popad
+            popfd
+            jmp DrawCursorTarget
+        }
+    }
+}
+
 namespace IntroFMVScreen
 {
 #pragma runtime_checks( "", off )
@@ -315,6 +378,7 @@ void Init()
     static float fLeftStickDeadzone = iniReader.ReadFloat("MISC", "LeftStickDeadzone", 10.0f);
     static int nFPSLimit = iniReader.ReadInteger("MISC", "FPSLimit", -1);
     int nHideDebugObjects = iniReader.ReadInteger("MISC", "HideDebugObjects", 0);
+    bool bClipFrontend = iniReader.ReadInteger("MISC", "ClipFrontend", 1) != 0;
     bool bBlackMagazineFix = iniReader.ReadInteger("MISC", "BlackMagazineFix", 0) != 0;
     if (szCustomUserFilesDirectoryInGameDir.empty() || szCustomUserFilesDirectoryInGameDir == "0")
         szCustomUserFilesDirectoryInGameDir.clear();
@@ -1023,6 +1087,52 @@ void Init()
             auto pattern = hook::pattern("8B 4C 24 4C 8B 16");
             FEPkgMgr_SendMessageToPackage_Cave_Exit = reinterpret_cast<decltype(FEPkgMgr_SendMessageToPackage_Cave_Exit)>(pattern.get_first(4)); //0x004F7D18;
             injector::MakeJMP(pattern.get_first(-4), FEPkgMgr_SendMessageToPackage_Cave, true);
+        }
+    }
+
+    if (bClipFrontend)
+    {
+        // Around the frontend's drawing (NA/EU 0x409E68 .. 0x409E8A / 0x409EC2, RU 0x409F5E .. 0x409FC2 / 0x409FFB). The
+        // start pattern has a second match in RU (0x4E3161), the first one is the right one there too.
+        auto start = hook::pattern("A1 ? ? ? ? 74 ? 85 C0");
+        auto restoreJmp = hook::pattern("E9 ? ? ? ? 85 C0 74 ? A1");
+        auto restore = hook::pattern("A1 ? ? ? ? 33 F6 85 C0 7E ? 8D 49");
+        if (restore.empty())
+            restore = hook::pattern("A1 ? ? ? ? 33 F6 85 C0 7E ? EB ? 8D A4 24 ? ? ? ? 90 8B 04 B5 ? ? ? ? 8B 80"); // RU
+        auto cursor = hook::pattern("E8 ? ? ? ? 83 C4 08 A1 ? ? ? ? 33 F6"); // Call that draws the mouse cursor (NA/EU 0x409EBA, RU 0x409FF3)
+        auto device = hook::pattern("A1 ? ? ? ? 8B 08 83 C4 04 57 6A 0E");
+        auto movie = hook::pattern("A1 ? ? ? ? 85 C0 74 ? BB");
+
+        if (!start.empty() && !restoreJmp.empty() && !restore.empty() && !cursor.empty() && !device.empty() && !movie.empty())
+        {
+            FEClip::pDevice = *device.get_first<LPDIRECT3DDEVICE9*>(1);
+            FEClip::pGameState = &nGameState.get();
+            FEClip::pMoviePlayer = *movie.get_first<void**>(1);
+            FEClip::pStartValue = *start.get_first<uint32_t*>(1);
+            FEClip::pRestoreValue = *restore.get_first<uint32_t*>(1);
+            FEClip::RestoreJmpTarget = injector::GetBranchDestination(restoreJmp.get_first(0)).as_int();
+            FEClip::DrawCursorTarget = injector::GetBranchDestination(cursor.get_first(0)).as_int();
+
+            struct FEClipStartHook
+            {
+                void operator()(injector::reg_pack& regs)
+                {
+                    regs.eax = *FEClip::pStartValue; // mov eax, [...] (the flags of the test before it are kept)
+                    FEClip::StartClip();
+                }
+            }; injector::MakeInline<FEClipStartHook>(start.get_first(0));
+
+            injector::MakeJMP(restoreJmp.get_first(0), FEClip::RestoreJmpCave, true);
+            injector::MakeCALL(cursor.get_first(0), FEClip::DrawCursorCave, true);
+
+            struct FEClipRestoreHook
+            {
+                void operator()(injector::reg_pack& regs)
+                {
+                    regs.eax = *FEClip::pRestoreValue; // mov eax, [...]
+                    FEClip::StopClip();
+                }
+            }; injector::MakeInline<FEClipRestoreHook>(restore.get_first(0));
         }
     }
 
