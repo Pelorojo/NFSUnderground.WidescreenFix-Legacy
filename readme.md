@@ -26,6 +26,17 @@ This version stays with the 2023 code base and focuses on:
 It is a drop-in replacement: same file names (`scripts\NFSUnderground.WidescreenFix.asi` / `.ini` / `.dat`),
 existing settings keep working.
 
+## Changes
+
+### v1.1
+
+- New `ClipFrontend` option (`[MISC]`, on by default): on screens wider than 4:3 the menus are clipped to the 4:3
+  area, so what the game draws outside of it no longer shows, e.g. the leftover tags on the online login or the
+  neighbor cars' names in the car select. The mouse cursor still shows on the whole screen. `ClipFrontend = 0`
+  turns it off.
+- `FPSLimit` is off by default (`0`), `LeftStickDeadzone` is `0.0` by default, also when the line is missing in
+  the ini.
+
 ## Installation
 
 1. Install an ASI loader (e.g. [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)) as `dinput8.dll` in the game folder.
