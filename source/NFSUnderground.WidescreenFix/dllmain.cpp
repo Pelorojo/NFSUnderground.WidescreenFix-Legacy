@@ -376,7 +376,7 @@ void Init()
     static auto szCustomUserFilesDirectoryInGameDir = iniReader.ReadString("MISC", "CustomUserFilesDirectoryInGameDir", "0");
     static int nImproveGamepadSupport = iniReader.ReadInteger("MISC", "ImproveGamepadSupport", 0);
     static float fLeftStickDeadzone = iniReader.ReadFloat("MISC", "LeftStickDeadzone", 10.0f);
-    static int nFPSLimit = iniReader.ReadInteger("MISC", "FPSLimit", -1);
+    static int nFPSLimit = iniReader.ReadInteger("MISC", "FPSLimit", 0);
     int nHideDebugObjects = iniReader.ReadInteger("MISC", "HideDebugObjects", 0);
     bool bClipFrontend = iniReader.ReadInteger("MISC", "ClipFrontend", 1) != 0;
     bool bBlackMagazineFix = iniReader.ReadInteger("MISC", "BlackMagazineFix", 0) != 0;
