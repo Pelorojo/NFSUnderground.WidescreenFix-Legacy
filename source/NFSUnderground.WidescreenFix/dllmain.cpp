@@ -1014,6 +1014,30 @@ void Init()
         static std::vector<std::wstring> TextsXBOX(ControlsTextsXBOX, std::end(ControlsTextsXBOX));
         static std::vector<std::wstring> TextsPS(ControlsTextsPS, std::end(ControlsTextsPS));
 
+        // The gamepad name for the game's text of a button/axis, empty = leave it. Buttons only by their exact number:
+        // "Button 11" (the Xbox controllers' Share button, "Share" with both names) contains " 1" and showed as B before
+        static auto GamepadName = [](const std::wstring& text) -> std::wstring
+        {
+            const auto& names = (nImproveGamepadSupport != 2) ? TextsXBOX : TextsPS;
+            size_t space = text.find_last_of(L' ');
+            if (space != std::wstring::npos && space + 1 < text.size()
+                && text.find_first_not_of(L"0123456789", space + 1) == std::wstring::npos)
+            {
+                int number = _wtoi(text.c_str() + space + 1);
+                if (number >= 0 && number <= 9)
+                    return names[number];
+                if (number == 11)
+                    return L"Share";
+                return L"";
+            }
+            for (size_t i = 10; i < Texts.size(); i++)
+            {
+                if (text.find(Texts[i]) != std::wstring::npos)
+                    return names[i];
+            }
+            return L"";
+        };
+
         pattern = hook::pattern("8D 43 60 8D 74 24 10 E8 ? ? ? ? 8B"); //0x4148F6
         struct Buttons
         {
@@ -1023,18 +1047,35 @@ void Init()
                 regs.esi = regs.esp + 0x10;
 
                 auto pszStr = (wchar_t*)(regs.esp + 0x10);
-                auto it = std::find_if(Texts.begin(), Texts.end(), [&](const std::wstring& str) { std::wstring s(pszStr); return s.find(str) != std::wstring::npos; });
-                auto i = std::distance(Texts.begin(), it);
-
-                if (it != Texts.end())
-                {
-                    if (nImproveGamepadSupport != 2)
-                        wcscpy(pszStr, TextsXBOX[i].c_str());
-                    else
-                        wcscpy(pszStr, TextsPS[i].c_str());
-                }
+                std::wstring name = GamepadName(pszStr);
+                if (!name.empty())
+                    wcscpy(pszStr, name.c_str());
             }
         }; if (pattern.size() > 0) { injector::MakeInline<Buttons>(pattern.get_first(0), pattern.get_first(7)); }
+        else
+        {
+            // Russian SoftClub release: builds the text as char itself (no MultiByteToWideChar) in [esp+0Ch], 22 characters
+            // at most, and ends it at [esp+22h] (RU 0x4149E5); replaced right after that, before its length is counted
+            pattern = hook::pattern("8D 44 24 0C C6 44 24 22 00 8D 50 01");
+            struct ButtonsRU
+            {
+                void operator()(injector::reg_pack& regs)
+                {
+                    regs.eax = regs.esp + 0x0C;
+                    *(char*)(regs.esp + 0x22) = '\0';
+
+                    auto pszStr = (char*)(regs.esp + 0x0C);
+                    std::wstring name = GamepadName(std::wstring(pszStr, pszStr + strlen(pszStr)));
+                    if (!name.empty())
+                    {
+                        size_t i = 0;
+                        for (; i < name.size() && i < 22; i++)
+                            pszStr[i] = static_cast<char>(name[i]);
+                        pszStr[i] = '\0';
+                    }
+                }
+            }; if (pattern.size() > 0) { injector::MakeInline<ButtonsRU>(pattern.get_first(0), pattern.get_first(9)); }
+        }
 
         // FrontEnd button remap (through game code, not key emulation)
         auto pattern = hook::pattern("8B 86 ? ? ? ? 8B 0C ? ? ? ? ? 85 C9 0F"); // 004071C5
@@ -1144,9 +1185,10 @@ void Init()
             FEClip::DrawCursorTarget = injector::GetBranchDestination(cursor.get_first(0)).as_int();
 
             // Where the frontend copies the name of the package it loads (NA/EU 0x4F7A9F, RU: same code); without it
-            // only the menus are clipped
+            // only the menus are clipped. Only with HUDWidescreenMode = 0: otherwise the .dat already moves away what
+            // the game parks outside the race results
             auto package = hook::pattern("8A 02 84 C0 A2 ? ? ? ? 74 16 B8");
-            if (!package.empty())
+            if (!bHUDWidescreenMode && !package.empty())
                 FEClip::pLoadedPackage = *package.get_first<const char*>(5);
 
             struct FEClipStartHook
