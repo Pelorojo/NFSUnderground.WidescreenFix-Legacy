@@ -502,24 +502,38 @@ HWND WINAPI CreateWindowExA_Hook_NFSU(DWORD dwExStyle, LPCSTR lpClassName, LPCST
     return retval;
 }
 
+// The ini reader's ReadInteger throws on an empty or non-number value (std::stoi), which crashed the game at start
+// ("FixHUD =" without a value): such a value counts as missing
+static int ReadIniInteger(CIniReader& ini, const char* section, const char* key, int defaultValue)
+{
+    try
+    {
+        return ini.ReadInteger(section, key, defaultValue);
+    }
+    catch (...)
+    {
+        return defaultValue;
+    }
+}
+
 void Init()
 {
     CIniReader iniReader("");
-    Screen.nWidth = iniReader.ReadInteger("MAIN", "ResX", 0);
-    Screen.nHeight = iniReader.ReadInteger("MAIN", "ResY", 0);
-    bool bFixHUD = iniReader.ReadInteger("MAIN", "FixHUD", 1) != 0;
-    bool bFixFOV = iniReader.ReadInteger("MAIN", "FixFOV", 1) != 0;
-    bool bScaling = iniReader.ReadInteger("MAIN", "Scaling", 0);
-    bool bHUDWidescreenMode = iniReader.ReadInteger("MAIN", "HUDWidescreenMode", 1) != 0;
-    int nFMVWidescreenMode = iniReader.ReadInteger("MAIN", "FMVWidescreenMode", 1);
-    bool bSkipIntro = iniReader.ReadInteger("MISC", "SkipIntro", 0) != 0;
-    bool bShowLangSelect = iniReader.ReadInteger("MISC", "ShowLangSelect", 0) != 0;
+    Screen.nWidth = ReadIniInteger(iniReader, "MAIN", "ResX", 0);
+    Screen.nHeight = ReadIniInteger(iniReader, "MAIN", "ResY", 0);
+    bool bFixHUD = ReadIniInteger(iniReader, "MAIN", "FixHUD", 1) != 0;
+    bool bFixFOV = ReadIniInteger(iniReader, "MAIN", "FixFOV", 1) != 0;
+    bool bScaling = ReadIniInteger(iniReader, "MAIN", "Scaling", 0);
+    bool bHUDWidescreenMode = ReadIniInteger(iniReader, "MAIN", "HUDWidescreenMode", 1) != 0;
+    int nFMVWidescreenMode = ReadIniInteger(iniReader, "MAIN", "FMVWidescreenMode", 1);
+    bool bSkipIntro = ReadIniInteger(iniReader, "MISC", "SkipIntro", 0) != 0;
+    bool bShowLangSelect = ReadIniInteger(iniReader, "MISC", "ShowLangSelect", 0) != 0;
     static auto szCustomUserFilesDirectoryInGameDir = iniReader.ReadString("MISC", "CustomUserFilesDirectoryInGameDir", "0");
-    static int nImproveGamepadSupport = iniReader.ReadInteger("MISC", "ImproveGamepadSupport", 0);
+    static int nImproveGamepadSupport = ReadIniInteger(iniReader, "MISC", "ImproveGamepadSupport", 0);
     static float fLeftStickDeadzone = iniReader.ReadFloat("MISC", "LeftStickDeadzone", 0.0f);
-    static int nFPSLimit = iniReader.ReadInteger("MISC", "FPSLimit", 0);
-    int nHideDebugObjects = iniReader.ReadInteger("MISC", "HideDebugObjects", 0);
-    bool bClipFrontend = iniReader.ReadInteger("MISC", "ClipFrontend", 1) != 0;
+    static int nFPSLimit = ReadIniInteger(iniReader, "MISC", "FPSLimit", 0);
+    int nHideDebugObjects = ReadIniInteger(iniReader, "MISC", "HideDebugObjects", 0);
+    bool bClipFrontend = ReadIniInteger(iniReader, "MISC", "ClipFrontend", 1) != 0;
     if (!bFixHUD)
     {
         // HUD and frontend stretched over the whole screen: nothing sits in a 4:3 area, so neither moving the HUD
@@ -527,11 +541,11 @@ void Init()
         bHUDWidescreenMode = false;
         bClipFrontend = false;
     }
-    bool bBlackMagazineFix = iniReader.ReadInteger("MISC", "BlackMagazineFix", 0) != 0;
-    bool bSaveKeyboardBindings = iniReader.ReadInteger("MISC", "SaveKeyboardBindings", 1) != 0;
+    bool bBlackMagazineFix = ReadIniInteger(iniReader, "MISC", "BlackMagazineFix", 0) != 0;
+    bool bSaveKeyboardBindings = ReadIniInteger(iniReader, "MISC", "SaveKeyboardBindings", 1) != 0;
     if (szCustomUserFilesDirectoryInGameDir.empty() || szCustomUserFilesDirectoryInGameDir == "0")
         szCustomUserFilesDirectoryInGameDir.clear();
-    int nWindowedMode = iniReader.ReadInteger("MISC", "WindowedMode", 0);
+    int nWindowedMode = ReadIniInteger(iniReader, "MISC", "WindowedMode", 0);
 
     if (!Screen.nWidth || !Screen.nHeight)
         std::tie(Screen.nWidth, Screen.nHeight) = GetDesktopRes();
