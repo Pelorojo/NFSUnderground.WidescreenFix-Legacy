@@ -167,8 +167,45 @@ namespace DebugTags
         return result;
     }
 
+    bool bDevObjects = false; // HideDebugObjects = 1
+
+    // Gives a text object a new string, like the game does it (NA/EU 0x41F060, RU 0x41F110; converts the text, then
+    // flags the object as changed)
+    unsigned int FEStringSetString_Addr = 0x0041F060;
+    void FEngSetString(const char* pkgname, unsigned int hash, const char* text)
+    {
+        unsigned int pkg = FEPkgMgr_FindPackage(pkgname);
+        unsigned int obj = pkg ? FEngFindObject((const char*)pkg, hash) : 0;
+        if (!obj || *(int*)(obj + 0x18) != 2) // 2 = text
+            return;
+        reinterpret_cast<void(__stdcall*)(unsigned int, const char*)>(FEStringSetString_Addr)(obj, text);
+        *(unsigned int*)(obj + 0x1C) |= 2;
+    }
+
+    // The display options: the resolution setting is fixed (see ResolutionHook), so its arrows (and their mouse areas)
+    // go, and the 800x600 it always shows becomes the actual resolution
+    void FixResolutionOption(const char* pkgname)
+    {
+        if (FEHashUpper(pkgname) != FEHashUpper("PC_graphics.fng"))
+            return;
+        FEngSetInvisible(pkgname, FEHashUpper("resolution_arrow_L"));
+        FEngSetInvisible(pkgname, FEHashUpper("resolution_arrow_R"));
+        FEngSetInvisible(pkgname, FEHashUpper("resolution_L_button"));
+        FEngSetInvisible(pkgname, FEHashUpper("resolution_R_button"));
+        if (FEStringSetString_Addr)
+        {
+            char text[32];
+            sprintf_s(text, "%d x %d", Screen.nWidth, Screen.nHeight);
+            FEngSetString(pkgname, FEHashUpper("Res_02"), text);
+        }
+    }
+
     void __stdcall CorruptAllFEDevObjects(char* pkgname)
     {
+        FixResolutionOption(pkgname);
+        if (!bDevObjects)
+            return;
+
         // so in order to hide the silly little side-tags used during FEng development, an attack at its FEObjects is necessary
         // all of them, and I mean each and every one of the tags' text object hashes and name is "ConduitMdITC_TT21i"
         // because of this, the game only references the first one in memory (which is usually next_tag), so FEngSetInvisible doesn't work
@@ -1345,7 +1382,6 @@ void Init()
     if (nHideDebugObjects == 2 && hook::pattern("A1 ? ? ? ? 8B 08 83 C4 04 50").empty())
         nHideDebugObjects = 1;
 
-    if (nHideDebugObjects)
     {
         if (nHideDebugObjects == 2)
         {
@@ -1367,19 +1403,45 @@ void Init()
                 }
             }; injector::MakeInline<EndSceneHook>(pattern.get_first(0), pattern.get_first(7));
         }
-        else
+        // The FE message hook also hides the fixed resolution's arrows, so it's always installed; the dev objects only
+        // with HideDebugObjects = 1
         {
             using namespace DebugTags;
+            bDevObjects = (nHideDebugObjects == 1);
             
             FEngSetInvisible_Addr = static_cast<decltype(FEngSetInvisible_Addr)>(injector::GetBranchDestination(hook::get_pattern("E8 ? ? ? ? 8A 43 61"))); //0x000495F70;
             FEHashUpper_Addr = static_cast<decltype(FEHashUpper_Addr)>(injector::GetBranchDestination(hook::get_pattern("E8 ? ? ? ? 8B 75 6C"))); //0x004FD230;
             FEngFindObject_Addr = static_cast<decltype(FEngFindObject_Addr)>(injector::GetBranchDestination(hook::get_pattern("E8 ? ? ? ? 3B C6 75 16"))); //0x004FFB70;
             FEPkgMgr_FindPackage_Addr = static_cast<decltype(FEPkgMgr_FindPackage_Addr)>(injector::GetBranchDestination(hook::get_pattern("E8 ? ? ? ? 8B 50 1C"))); //0x004F65D0;
+            auto setString = hook::pattern("81 EC 00 08 00 00 53 8B 9C 24 08 08 00 00 56 57 8B 3D ? ? ? ? 68 00 08 00 00");
+            FEStringSetString_Addr = setString.empty() ? 0 : reinterpret_cast<decltype(FEStringSetString_Addr)>(setString.get_first(0)); //0x0041F060;
 
             auto pattern = hook::pattern("8B 4C 24 4C 8B 16");
             FEPkgMgr_SendMessageToPackage_Cave_Exit = reinterpret_cast<decltype(FEPkgMgr_SendMessageToPackage_Cave_Exit)>(pattern.get_first(4)); //0x004F7D18;
             injector::MakeJMP(pattern.get_first(-4), FEPkgMgr_SendMessageToPackage_Cave, true);
         }
+    }
+
+    // The game's own resolution setting (Options > Display, 640x480 .. 1280x1024) does nothing here, the resolution
+    // comes from ResX/ResY. Where the game checks the saved setting against the modes the monitor offers (NA/EU 0x410E12,
+    // RU likewise; RES at 0x700E70/RU 0x700F80, the modes at 0x71B7B0/RU 0x71BD10): only 800x600 (index 1, the default)
+    // is offered from then on, and the setting is always that one, so the menu can't change it either (left/right only
+    // step through offered modes). Also avoids the game's search for a replacement there, which runs past the end of
+    // the five modes until the index overflows
+    if (auto res = hook::pattern("A1 ? ? ? ? 8B 0C 85 ? ? ? ? 85 C9 75 21 85 C0 7C 1D"); !res.empty())
+    {
+        static int32_t* pResolution = *res.get_first<int32_t*>(1);
+        static int32_t* pModeOffered = *res.get_first<int32_t*>(8);
+        struct ResolutionHook
+        {
+            void operator()(injector::reg_pack& regs)
+            {
+                for (int i = 0; i < 5; i++)
+                    pModeOffered[i] = (i == 1) ? 1 : 0;
+                *pResolution = 1;
+                regs.eax = 1; // mov eax, [RES]
+            }
+        }; injector::MakeInline<ResolutionHook>(res.get_first(0));
     }
 
     if (bClipFrontend)
