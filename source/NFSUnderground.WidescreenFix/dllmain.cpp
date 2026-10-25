@@ -275,13 +275,27 @@ namespace FEClip
     uint32_t* pRestoreValue = nullptr; // What the second end spot loads into EAX
     uintptr_t RestoreJmpTarget = 0;    // Where the first end spot's JMP goes
     uintptr_t DrawCursorTarget = 0;    // The function that draws the mouse cursor (its position from 0x70649C/0x7064A0)
+    const char* pLoadedPackage = nullptr; // Name of the last loaded package (NA/EU 0x72CDD0, RU 0x72D330), nullptr = not found
     bool bActive = false;
 
     void StartClip()
     {
-        if (*pGameState != 3 || *pMoviePlayer || !*pDevice || Screen.fHudOffsetReal < 1.0f)
+        if (*pMoviePlayer || !*pDevice)
             return;
-        RECT rect = { static_cast<LONG>(Screen.fHudOffsetReal), 0, static_cast<LONG>(Screen.fHudOffsetReal + Screen.fWidth43), static_cast<LONG>(Screen.nHeight) };
+        // The menus (game state 3) to 4:3. The race results run in the race (game state 6) and are wider than 4:3:
+        // 16:10 there, which still hides the scores the game parks outside of them. In the race the name stays
+        // that of the last menu, so it only says PostRaceResults while they are shown.
+        float fClipWidth;
+        if (*pGameState == 3)
+            fClipWidth = Screen.fWidth43;
+        else if (*pGameState == 6 && pLoadedPackage && strncmp(pLoadedPackage, "PostRaceResults", 15) == 0)
+            fClipWidth = Screen.fHeight * 1.6f;
+        else
+            return;
+        const float fLeft = (Screen.fWidth - fClipWidth) / 2.0f;
+        if (fLeft < 1.0f)
+            return;
+        RECT rect = { static_cast<LONG>(fLeft), 0, static_cast<LONG>(fLeft + fClipWidth), static_cast<LONG>(Screen.nHeight) };
         (*pDevice)->SetScissorRect(&rect);
         (*pDevice)->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
         bActive = true;
@@ -379,6 +393,13 @@ void Init()
     static int nFPSLimit = iniReader.ReadInteger("MISC", "FPSLimit", 0);
     int nHideDebugObjects = iniReader.ReadInteger("MISC", "HideDebugObjects", 0);
     bool bClipFrontend = iniReader.ReadInteger("MISC", "ClipFrontend", 1) != 0;
+    if (!bFixHUD)
+    {
+        // HUD and frontend stretched over the whole screen: nothing sits in a 4:3 area, so neither moving the HUD
+        // to the edges nor clipping to 4:3 makes sense
+        bHUDWidescreenMode = false;
+        bClipFrontend = false;
+    }
     bool bBlackMagazineFix = iniReader.ReadInteger("MISC", "BlackMagazineFix", 0) != 0;
     if (szCustomUserFilesDirectoryInGameDir.empty() || szCustomUserFilesDirectoryInGameDir == "0")
         szCustomUserFilesDirectoryInGameDir.clear();
@@ -616,7 +637,10 @@ void Init()
         }
     }
 
-    if (bHUDWidescreenMode && (Screen.fAspectRatio > (4.0f / 3.0f)))
+    // With HUDWidescreenMode = 0 only the .dat's removal entries (offset -9999) are used: the HUD stays in the
+    // 4:3 area, but objects the game parks just outside it (e.g. the drift scores after a race) would show in
+    // the pillarbox area
+    if (bFixHUD && (Screen.fAspectRatio > (4.0f / 3.0f)))
     {
         static std::vector<CDatEntry> HudCoords;
 
@@ -628,11 +652,14 @@ void Init()
         else
             DataFilePath.append(".dat");
 
-        LoadDatFile(DataFilePath, [](std::string_view line)
+        LoadDatFile(DataFilePath, [bHUDWidescreenMode](std::string_view line)
         {
             int32_t PosX, PosY;
             float fOffsetX, fOffsetY;
             sscanf_s(line.data(), "%*s %x %x %f %f %*f %*f", &PosX, &PosY, &fOffsetX, &fOffsetY);
+
+            if (!bHUDWidescreenMode && fOffsetX > -9000.0f)
+                return;
 
             if (Screen.fAspectRatio < (16.0f / 9.0f))
                 fOffsetX /= (((16.0f / 9.0f) / Screen.fAspectRatio) * 1.5f);
@@ -682,9 +709,12 @@ void Init()
                 }
             }; injector::MakeInline<HudHook>(pattern.get_first(0), pattern.get_first(6));
 
-            pattern = hook::pattern("D8 05 ? ? ? ? D9 5B 68 D8 05 ? ? ? ? D9 5B 6C D9 40 3C");
-            injector::WriteMemory(pattern.get_first(2), &fMinimapPosX, true);
-            injector::WriteMemory(pattern.get_first(11), &fMinimapPosY, true);
+            if (bHUDWidescreenMode)
+            {
+                pattern = hook::pattern("D8 05 ? ? ? ? D9 5B 68 D8 05 ? ? ? ? D9 5B 6C D9 40 3C");
+                injector::WriteMemory(pattern.get_first(2), &fMinimapPosX, true);
+                injector::WriteMemory(pattern.get_first(11), &fMinimapPosY, true);
+            }
 
             pattern = hook::pattern("8B 4D 08 D9 41 68 53 57 8B 5D 0C 8B F8");
             struct MinimapHook1
@@ -1112,6 +1142,12 @@ void Init()
             FEClip::pRestoreValue = *restore.get_first<uint32_t*>(1);
             FEClip::RestoreJmpTarget = injector::GetBranchDestination(restoreJmp.get_first(0)).as_int();
             FEClip::DrawCursorTarget = injector::GetBranchDestination(cursor.get_first(0)).as_int();
+
+            // Where the frontend copies the name of the package it loads (NA/EU 0x4F7A9F, RU: same code); without it
+            // only the menus are clipped
+            auto package = hook::pattern("8A 02 84 C0 A2 ? ? ? ? 74 16 B8");
+            if (!package.empty())
+                FEClip::pLoadedPackage = *package.get_first<const char*>(5);
 
             struct FEClipStartHook
             {
