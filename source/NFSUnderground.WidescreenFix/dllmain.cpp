@@ -1,6 +1,9 @@
 #include "stdafx.h"
 #include "GTA\CFileMgr.h"
 #include <d3d9.h>
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
+#include <shlobj.h>
 
 struct Screen
 {
@@ -340,6 +343,130 @@ namespace FEClip
     }
 }
 
+// The game keeps its keyboard bindings with DirectInput's action mapping (BuildActionMap/SetActionMap on the keyboard
+// only, NA/EU/RU 0x405C60/0x407760), which saves them through dimap.dll. Windows doesn't ship dimap.dll anymore, and
+// with it the game freezes on some PCs, so without it the keyboard was back to the defaults on every start. These two
+// calls are taken over on the device vtable (shared by every IDirectInputDevice8A, but only the keyboard uses them):
+// a SetActionMap with DIDSAM_FORCESAVE also writes the format's actions to Keyboard.map next to the game's .cfg files,
+// and after BuildActionMap they are put back (same index, uAppData and dwSemantic, so a changed format is ignored)
+namespace KeyboardBindings
+{
+    typedef HRESULT(__stdcall* ActionMapFn)(void* pDevice, LPDIACTIONFORMATA lpdiaf, LPCSTR lpszUserName, DWORD dwFlags);
+    ActionMapFn pBuildActionMap = nullptr;
+    ActionMapFn pSetActionMap = nullptr;
+    std::string Folder; // ...\NFS Underground\ (as the game's .cfg), set in Init
+
+    std::string FilePath() { return Folder + "Keyboard.map"; }
+
+    // Lines: <format name>\t<index>\t<uAppData>\t<dwSemantic>\t<dwObjID>\t<dwHow>
+    std::vector<std::string> ReadLines()
+    {
+        std::vector<std::string> lines;
+        if (FILE* f = fopen(FilePath().c_str(), "r"))
+        {
+            char line[512];
+            while (fgets(line, sizeof(line), f))
+            {
+                std::string text(line);
+                while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+                    text.pop_back();
+                if (!text.empty())
+                    lines.push_back(text);
+            }
+            fclose(f);
+        }
+        return lines;
+    }
+
+    void Save(LPDIACTIONFORMATA lpdiaf)
+    {
+        std::string name = lpdiaf->tszActionMap;
+        std::vector<std::string> lines;
+        for (auto& line : ReadLines())
+        {
+            if (line.compare(0, name.size() + 1, name + "\t") != 0)
+                lines.push_back(line);
+        }
+        for (DWORD i = 0; i < lpdiaf->dwNumActions; i++)
+        {
+            const DIACTIONA& action = lpdiaf->rgoAction[i];
+            char line[400];
+            sprintf_s(line, "%s\t%u\t%u\t%u\t%u\t%u", name.c_str(), i, (unsigned)action.uAppData, action.dwSemantic, action.dwObjID, action.dwHow);
+            lines.push_back(line);
+        }
+        CreateDirectoryA(Folder.c_str(), NULL);
+        std::string tmp = FilePath() + ".tmp";
+        if (FILE* f = fopen(tmp.c_str(), "w"))
+        {
+            for (auto& line : lines)
+                fprintf(f, "%s\n", line.c_str());
+            fclose(f);
+            MoveFileExA(tmp.c_str(), FilePath().c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+
+    void Restore(LPDIACTIONFORMATA lpdiaf)
+    {
+        std::string name = lpdiaf->tszActionMap;
+        for (auto& line : ReadLines())
+        {
+            if (line.compare(0, name.size() + 1, name + "\t") != 0)
+                continue;
+            unsigned index, appData, semantic, objID, how;
+            if (sscanf_s(line.c_str() + name.size() + 1, "%u\t%u\t%u\t%u\t%u", &index, &appData, &semantic, &objID, &how) != 5)
+                continue;
+            if (index >= lpdiaf->dwNumActions)
+                continue;
+            DIACTIONA& action = lpdiaf->rgoAction[index];
+            if (action.uAppData != appData || action.dwSemantic != semantic)
+                continue;
+            action.dwObjID = objID;
+            action.dwHow = how;
+        }
+    }
+
+    HRESULT __stdcall BuildActionMapHook(void* pDevice, LPDIACTIONFORMATA lpdiaf, LPCSTR lpszUserName, DWORD dwFlags)
+    {
+        HRESULT hr = pBuildActionMap(pDevice, lpdiaf, lpszUserName, dwFlags);
+        if (SUCCEEDED(hr) && lpdiaf && lpdiaf->rgoAction)
+            Restore(lpdiaf);
+        return hr;
+    }
+
+    HRESULT __stdcall SetActionMapHook(void* pDevice, LPDIACTIONFORMATA lpdiaf, LPCSTR lpszUserName, DWORD dwFlags)
+    {
+        if ((dwFlags & DIDSAM_FORCESAVE) && lpdiaf && lpdiaf->rgoAction)
+            Save(lpdiaf);
+        return pSetActionMap(pDevice, lpdiaf, lpszUserName, dwFlags);
+    }
+
+    // A keyboard device of our own, only to get to the vtable all devices share
+    void Install(const std::string& folder)
+    {
+        Folder = folder;
+        HMODULE dinput8 = LoadLibraryA("dinput8.dll");
+        auto pDirectInput8Create = dinput8 ? (decltype(&DirectInput8Create))GetProcAddress(dinput8, "DirectInput8Create") : nullptr;
+        if (!pDirectInput8Create)
+            return;
+        static const GUID IID_DirectInput8A = { 0xBF798030, 0x483A, 0x4DA2, { 0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00 } };
+        static const GUID GUID_Keyboard = { 0x6F1D2B61, 0xD5A0, 0x11CF, { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+        IDirectInput8A* pDI = nullptr;
+        if (FAILED(pDirectInput8Create(GetModuleHandleA(NULL), DIRECTINPUT_VERSION, IID_DirectInput8A, (void**)&pDI, NULL)) || !pDI)
+            return;
+        IDirectInputDevice8A* pKeyboard = nullptr;
+        if (SUCCEEDED(pDI->CreateDevice(GUID_Keyboard, &pKeyboard, NULL)) && pKeyboard)
+        {
+            void** vtable = *(void***)pKeyboard;
+            pBuildActionMap = (ActionMapFn)vtable[29]; // 0x74
+            pSetActionMap = (ActionMapFn)vtable[30];   // 0x78
+            injector::WriteMemory(&vtable[29], (void*)BuildActionMapHook, true);
+            injector::WriteMemory(&vtable[30], (void*)SetActionMapHook, true);
+            pKeyboard->Release();
+        }
+        pDI->Release();
+    }
+}
+
 namespace IntroFMVScreen
 {
 #pragma runtime_checks( "", off )
@@ -401,6 +528,7 @@ void Init()
         bClipFrontend = false;
     }
     bool bBlackMagazineFix = iniReader.ReadInteger("MISC", "BlackMagazineFix", 0) != 0;
+    bool bSaveKeyboardBindings = iniReader.ReadInteger("MISC", "SaveKeyboardBindings", 1) != 0;
     if (szCustomUserFilesDirectoryInGameDir.empty() || szCustomUserFilesDirectoryInGameDir == "0")
         szCustomUserFilesDirectoryInGameDir.clear();
     int nWindowedMode = iniReader.ReadInteger("MISC", "WindowedMode", 0);
@@ -867,6 +995,17 @@ void Init()
         }
     }
 
+    if (bSaveKeyboardBindings)
+    {
+        // Where the game keeps its .cfg files: CSIDL_COMMON_APPDATA (or the CustomUserFilesDirectoryInGameDir) + "\NFS Underground\"
+        char folder[MAX_PATH] = {};
+        if (!szCustomUserFilesDirectoryInGameDir.empty())
+            strcpy_s(folder, szCustomUserFilesDirectoryInGameDir.c_str());
+        else
+            SHGetFolderPathA(NULL, CSIDL_COMMON_APPDATA | CSIDL_FLAG_CREATE, NULL, 0, folder);
+        KeyboardBindings::Install(std::string(folder) + "\\NFS Underground\\");
+    }
+
     if (nImproveGamepadSupport)
     {
         pattern = hook::pattern("6A FF 68 ? ? ? ? 64 A1 00 00 00 00 50 64 89 25 00 00 00 00 51 A1 ? ? ? ? 57");
@@ -1014,11 +1153,77 @@ void Init()
         static std::vector<std::wstring> TextsXBOX(ControlsTextsXBOX, std::end(ControlsTextsXBOX));
         static std::vector<std::wstring> TextsPS(ControlsTextsPS, std::end(ControlsTextsPS));
 
-        // The gamepad name for the game's text of a button/axis, empty = leave it. Buttons only by their exact number:
-        // "Button 11" (the Xbox controllers' Share button, "Share" with both names) contains " 1" and showed as B before
+        // The device the controls screen shows (its type at +0x134, 0x13 = keyboard): NA/EU index 0x736344/0x73633C,
+        // table 0x71B808, base 0x78DAA8/0x78DA98; RU 0x73689C, 0x71BD68, 0x78DFF8
+        static uint32_t* pDeviceIndex = nullptr;
+        static uint32_t* pDeviceTable = nullptr;
+        static uintptr_t DeviceBase = 0;
+        if (auto device = hook::pattern("A1 ? ? ? ? 8D 0C 40 8B 04 8D ? ? ? ? 69 C0 70 02 00 00 05 ? ? ? ? 83 B8 34 01 00 00 13"); !device.empty())
+        {
+            pDeviceIndex = *device.get_first<uint32_t*>(1);
+            pDeviceTable = *device.get_first<uint32_t*>(11);
+            DeviceBase = *device.get_first<uintptr_t>(22);
+        }
+        else if (auto deviceRU = hook::pattern("A1 ? ? ? ? 53 8D 0C 40 8B 1C 8D ? ? ? ? 69 DB 70 02 00 00 81 C3 ? ? ? ? 83 BB 34 01 00 00 13"); !deviceRU.empty())
+        {
+            pDeviceIndex = *deviceRU.get_first<uint32_t*>(1);
+            pDeviceTable = *deviceRU.get_first<uint32_t*>(12);
+            DeviceBase = *deviceRU.get_first<uintptr_t>(24);
+        }
+
+        // The game asks DirectInput for the object's name with GetObjectInfo into a DIDEVICEOBJECTINSTANCEA (NA 0x78ECE8,
+        // EU 0x78ECD8, RU 0x78F250): its type and GUID say what it is in every language, the name is at +0x20
+        static uint8_t* pObjectInfo = nullptr;
+        if (auto info = hook::pattern("B9 4F 00 00 00 BF ? ? ? ? F3 AB C7 05"); !info.empty())
+            pObjectInfo = *info.get_first<uint8_t*>(6);
+
+        // The gamepad name for the game's text of a button/axis, empty = leave it. Never on the keyboard page: its key
+        // names come from Windows in its language and "Num 4" became LB. The controller's names may be localized too
+        // ("<axis> X" on a Russian Windows, the font has no Cyrillic), so it goes by the object DirectInput describes:
+        // buttons by their exact number ("Button 11", the Xbox controllers' Share button, showed as B before)
         static auto GamepadName = [](const std::wstring& text) -> std::wstring
         {
+            if (pDeviceIndex && *(int32_t*)(DeviceBase + 0x270 * pDeviceTable[3 * *pDeviceIndex] + 0x134) == 0x13)
+                return L"";
             const auto& names = (nImproveGamepadSupport != 2) ? TextsXBOX : TextsPS;
+
+            // The text shown is (the start of) the name the game just got for this object
+            if (pObjectInfo && !text.empty())
+            {
+                const char* pszName = (const char*)(pObjectInfo + 0x20);
+                wchar_t wszName[260] = {};
+                MultiByteToWideChar(CP_ACP, 0, pszName, -1, wszName, 260);
+                if (std::wstring(wszName).compare(0, text.size(), text) == 0)
+                {
+                    // dwType (+0x18) and guidType (+0x04) mean the same with every data format (the game's own
+                    // isn't c_dfDIJoystick, so dwOfs doesn't): button/POV by type, axis by its GUID (Data1)
+                    uint32_t type = *(uint32_t*)(pObjectInfo + 0x18);
+                    uint32_t instance = (type >> 8) & 0xFFFF;
+                    if (type & 0x0C) // DIDFT_BUTTON
+                    {
+                        if (instance <= 9)
+                            return names[instance];
+                        if (instance == 11)
+                            return L"Share";
+                        return L"";
+                    }
+                    if (type & 0x10) // DIDFT_POV
+                        return names[19];
+                    if (type & 0x03) // DIDFT_AXIS
+                    {
+                        switch (*(uint32_t*)(pObjectInfo + 0x04))
+                        {
+                        case 0xA36D02E0: return names[16]; // GUID_XAxis
+                        case 0xA36D02E1: return names[17]; // GUID_YAxis
+                        case 0xA36D02E2: return names[18]; // GUID_ZAxis (both triggers on Xbox controllers)
+                        case 0xA36D02F4: return names[14]; // GUID_RxAxis
+                        case 0xA36D02F5: return names[15]; // GUID_RyAxis
+                        }
+                    }
+                    return L"";
+                }
+            }
+
             size_t space = text.find_last_of(L' ');
             if (space != std::wstring::npos && space + 1 < text.size()
                 && text.find_first_not_of(L"0123456789", space + 1) == std::wstring::npos)
@@ -1065,7 +1270,9 @@ void Init()
                     *(char*)(regs.esp + 0x22) = '\0';
 
                     auto pszStr = (char*)(regs.esp + 0x0C);
-                    std::wstring name = GamepadName(std::wstring(pszStr, pszStr + strlen(pszStr)));
+                    wchar_t wszText[32] = {};
+                    MultiByteToWideChar(CP_ACP, 0, pszStr, -1, wszText, 32); // Like the name it's compared with
+                    std::wstring name = GamepadName(wszText);
                     if (!name.empty())
                     {
                         size_t i = 0;
