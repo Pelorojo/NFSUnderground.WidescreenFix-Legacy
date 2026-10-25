@@ -19,7 +19,7 @@ workspace "NFSUnderground.WidescreenFix-Legacy"
 
    defines { "rsc_CompanyName=\"ThirteenAG, Pelorojo\"" }
    defines { "rsc_LegalCopyright=\"MIT License\""}
-   defines { "rsc_FileVersion=\"1.1.0.0\"", "rsc_ProductVersion=\"1.1.0.0\"" }
+   defines { "rsc_FileVersion=\"1.2.0.0\"", "rsc_ProductVersion=\"1.2.0.0\"" }
    defines { "rsc_InternalName=\"%{prj.name}\"", "rsc_ProductName=\"%{prj.name} Legacy\"", "rsc_OriginalFilename=\"%{prj.name}.asi\"" }
    defines { "rsc_FileDescription=\"NFSUnderground.WidescreenFix Legacy (EU/SoftClub compatible)\"" }
    defines { "rsc_UpdateUrl=\"https://github.com/Pelorojo/NFSUnderground.WidescreenFix-Legacy\"" }

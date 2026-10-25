@@ -20,13 +20,33 @@ This version stays with the 2023 code base and focuses on:
   - `ShowLangSelect`: the game's own language menu is broken in this release, so the option is ignored
   - `HideDebugObjects = 2` (pillarboxing): falls back to 1
   - `BlackMagazineFix`: ignored
-  - `ImproveGamepadSupport`: works (button icons, front-end actions), but the controls setup keeps the raw
-    DirectInput names ("Button 0" instead of "A")
 
 It is a drop-in replacement: same file names (`scripts\NFSUnderground.WidescreenFix.asi` / `.ini` / `.dat`),
 existing settings keep working.
 
 ## Changes
+
+### v1.2
+
+- New `SaveKeyboardBindings` option (`[MISC]`, on by default): the game keeps its keyboard bindings through
+  DirectInput's action mapping, which saves them via `dimap.dll`. Windows doesn't ship it anymore (and with it the
+  game freezes on some PCs), so the keyboard was back to the defaults on every start. The bindings are now saved in
+  `Keyboard.map` next to the profiles and put back on start. `SaveKeyboardBindings = 0` turns it off.
+- The game's own resolution setting (Options > Display) is fixed to 800x600, its default: with the fix the
+  resolution comes from `ResX`/`ResY` (or the desktop), the setting did nothing but could be changed anyway. The
+  arrows are gone and the menu shows the resolution the game actually renders at.
+- `ClipFrontend` also clips the race results to 16:10 with `HUDWidescreenMode = 0`, so texts the game parks just
+  outside of them (drift scores, placeholder times) no longer show. With `HUDWidescreenMode = 0` the objects parked
+  outside the 4:3 HUD no longer show in the pillarbox area either.
+- `FixHUD = 0` switches `HUDWidescreenMode` and `ClipFrontend` off, nothing sits in a 4:3 area then.
+- `ImproveGamepadSupport`:
+  - button names are matched by their exact number: buttons from 10 on showed as "B", the Xbox controllers'
+    Share button ("Button 11") is now "Share"
+  - the controls setup shows the gamepad names in the Russian SoftClub release too, also with localized
+    (e.g. Russian) DirectInput names
+  - the keyboard page keeps the key names (e.g. "Num 4" became "LB")
+- An empty or non-number value in the ini (e.g. `FixHUD =`) counts as missing, the default is used. The game
+  crashed at start before.
 
 ### v1.1
 
