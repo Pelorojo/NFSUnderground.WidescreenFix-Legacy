@@ -1,6 +1,8 @@
 #include "stdafx.h"
 #include "GTA\CFileMgr.h"
 #include <d3d9.h>
+#include <algorithm>
+#include <cmath>
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
 #include <shlobj.h>
@@ -109,6 +111,52 @@ void __declspec(naked) MaybeClearSurfaceDuringBackgroundRender()
         resume:
         mov esi, off_71AA4C
         ret
+    }
+}
+
+// The vinyl layer screen's "vinyl color" (the layer's color picker) answers a console button the PC version has no key
+// for there, so it was mouse only. C (keyboard) or the pad's Select (which ImproveGamepadSupport turns into C) sends
+// that button's message to the active screen.
+// Tells other plugins that C / Select open the vinyl color (the LapRecorder shows the key's icon there only then)
+extern "C" __declspec(dllexport) const int VinylColorKey = 1;
+
+namespace VinylColor
+{
+    const char* pLoadedFng = nullptr;           // 0x72CDD0 (RU 0x72D330), name of the active frontend package
+    uintptr_t FEngSendMessageToActive_Addr = 0; // 0x4C96C0, message pushed, package name in eax
+
+    void Send()
+    {
+        static DWORD lastSent = 0;
+        if (!pLoadedFng || !FEngSendMessageToActive_Addr || strcmp(pLoadedFng, "MU_GarageVinylLayerV2.fng") != 0)
+            return;
+        const DWORD now = GetTickCount();
+        if (lastSent && now - lastSent < 300) // Select also sends a C: only once
+            return;
+        lastSent = now;
+        const char* package = pLoadedFng;
+        uint32_t message = 0xC519BFC0; // Handled by the vinyl layer screen (0x4E3320)
+        uintptr_t send = FEngSendMessageToActive_Addr;
+        _asm
+        {
+            mov eax, package
+            push message
+            call send
+            add esp, 4
+        }
+    }
+
+    // Called with every frontend message (the screens get one each frame): C pressed while the game is in front
+    void PollKeyboard()
+    {
+        static bool wasDown = false;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+        const bool down = pid == GetCurrentProcessId() && (GetAsyncKeyState('C') & 0x8000);
+        const bool pressed = down && !wasDown;
+        wasDown = down; // Before Send: its message comes through here again
+        if (pressed)
+            Send();
     }
 }
 
@@ -293,6 +341,7 @@ namespace DebugTags
             mov FEPkgMgr_SendMessageToPackage_ESI, esi
         }
         CorruptAllFEDevObjects(*(char**)(FEPkgMgr_SendMessageToPackage_ESI + 0xC));
+        VinylColor::PollKeyboard();
         _asm
         {
             mov eax, FEPkgMgr_SendMessageToPackage_EAX
@@ -1107,6 +1156,29 @@ void Init()
             int8_t RSClick;
         };
 
+        // Right stick turns the car in the menus like dragging with the mouse: a movement per frame in the orbit values
+        // while the orbit is "held". The car view checks the mouse button for that, but the frontend reads the same
+        // button as a click (sound), so the car view's check also takes the stick (the button itself isn't touched).
+        static uint8_t* pOrbitMouseHeld = nullptr; //0x7064B0
+        static int32_t* pOrbitDelta = nullptr;     //0x7064A4 (x), +4 (y)
+        static bool bOrbitStick = false;
+        static uintptr_t OrbitNotHeld = 0;
+        if (auto orbit = hook::pattern("38 1D ? ? ? ? 74 76 8B 0D"); !orbit.empty()) //0x4B0CB9: cmp [mouse button], bl / je
+        {
+            pOrbitMouseHeld = *orbit.get_first<uint8_t*>(2);
+            pOrbitDelta = *orbit.get_first<int32_t*>(10);
+            OrbitNotHeld = reinterpret_cast<uintptr_t>(orbit.get_first(8)) + *orbit.get_first<int8_t>(7); //0x4B0D37
+            struct OrbitHeldHook
+            {
+                void operator()(injector::reg_pack& regs)
+                {
+                    const bool held = *pOrbitMouseHeld != static_cast<uint8_t>(regs.ebx) || bOrbitStick;
+                    if (!held)
+                        *(uint32_t*)(regs.esp - 4) = OrbitNotHeld;
+                }
+            }; injector::MakeInline<OrbitHeldHook>(orbit.get_first(0), orbit.get_first(8));
+        }
+
         static bool Zstate, Pstate, Tstate, Dstate, Qstate, Cstate;
         pattern = hook::pattern("7C ? 5F 5D 5E 33 C0 5B C2 08 00"); //0x41989E
         injector::WriteMemory(pattern.count(1).get(0).get<uint32_t>(8 + 5), 0x900008C2, true);
@@ -1187,11 +1259,50 @@ void Init()
                         {
                             keybd_event(BYTE(VkKeyScan('C')), 0, KEYEVENTF_EXTENDEDKEY, 0);
                             keybd_event(BYTE(VkKeyScan('C')), 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
+                            VinylColor::Send(); // The C above may come too short to be seen by VinylColor::PollKeyboard
                         }
                         Cstate = true;
                     }
                     else
                         Cstate = false;
+
+                    // Right stick: [-10000, 10000], dead zone 20 %, full deflection 300 frontend pixels (480 high) a second
+                    if (pOrbitDelta)
+                    {
+                        static DWORD lastTick = 0;
+                        static float restX = 0.0f, restY = 0.0f;
+                        const DWORD now = GetTickCount();
+                        const float seconds = (lastTick && now > lastTick) ? (std::min)((now - lastTick) / 1000.0f, 0.1f) : 0.0f;
+                        lastTick = now;
+                        auto shape = [](int32_t axis) {
+                            const float v = std::clamp(axis / 10000.0f, -1.0f, 1.0f);
+                            const float a = std::fabs(v);
+                            return (a <= 0.2f) ? 0.0f : std::copysign((a - 0.2f) / 0.8f, v);
+                        };
+                        const float x = shape(PadKeyPresses->RSAxis1), y = shape(PadKeyPresses->RSAxis2);
+                        if (x != 0.0f || y != 0.0f)
+                        {
+                            restX += x * 300.0f * seconds;
+                            restY += y * 300.0f * seconds;
+                            const int32_t dx = static_cast<int32_t>(restX), dy = static_cast<int32_t>(restY);
+                            restX -= dx;
+                            restY -= dy;
+                            pOrbitDelta[0] = dx;
+                            pOrbitDelta[1] = dy;
+                            bOrbitStick = true;
+                        }
+                        else if (bOrbitStick)
+                        {
+                            pOrbitDelta[0] = pOrbitDelta[1] = 0;
+                            restX = restY = 0.0f;
+                            bOrbitStick = false;
+                        }
+                    }
+                }
+                else if (nGameState != 3 && bOrbitStick)
+                {
+                    pOrbitDelta[0] = pOrbitDelta[1] = 0;
+                    bOrbitStick = false;
                 }
             }
         }; injector::MakeInline<CatchPad>(pattern.get_first(8));
@@ -1419,6 +1530,12 @@ void Init()
             auto pattern = hook::pattern("8B 4C 24 4C 8B 16");
             FEPkgMgr_SendMessageToPackage_Cave_Exit = reinterpret_cast<decltype(FEPkgMgr_SendMessageToPackage_Cave_Exit)>(pattern.get_first(4)); //0x004F7D18;
             injector::MakeJMP(pattern.get_first(-4), FEPkgMgr_SendMessageToPackage_Cave, true);
+
+            // Vinyl color with C / Select (see VinylColor)
+            if (auto fng = hook::pattern("8A 02 84 C0 A2 ? ? ? ? 74 16 B8"); !fng.empty()) //0x4F7AA3
+                VinylColor::pLoadedFng = *fng.get_first<const char*>(5);
+            if (auto send = hook::pattern("68 ? ? ? 00 E8 ? ? ? ? 85 C0 74 21 8B 48 18 85 C9 74 1A 8B 40 14 85 C0 74 13 56 51"); !send.empty())
+                VinylColor::FEngSendMessageToActive_Addr = reinterpret_cast<uintptr_t>(send.get_first(0));
         }
     }
 
