@@ -26,6 +26,13 @@ existing settings keep working.
 
 ## Changes
 
+### v1.3
+
+- `ImproveGamepadSupport`: the right stick turns the car in the menus, like dragging with the mouse (without the
+  mouse click sound).
+- "vinyl color" on the vinyl layer screen was mouse only: C (keyboard) or the pad's Select opens it now, the same
+  button as "Customize Car". With the LapRecorder its icon is shown there.
+
 ### v1.2
 
 - New `SaveKeyboardBindings` option (`[MISC]`, on by default): the game keeps its keyboard bindings through
