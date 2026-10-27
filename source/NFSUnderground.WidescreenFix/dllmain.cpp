@@ -5,6 +5,7 @@
 #include <cmath>
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
+#include <xinput.h>
 #include <shlobj.h>
 
 struct Screen
@@ -57,12 +58,6 @@ void LoadDatFile(std::string_view str, std::function<void(std::string_view line)
     }
 }
 
-void DrawRect(LPDIRECT3DDEVICE9 pDevice, int32_t x, int32_t y, int32_t w, int32_t h, D3DCOLOR color = D3DCOLOR_XRGB(0, 0, 0))
-{
-    D3DRECT BarRect = { x, y, x + w, y + h };
-    pDevice->Clear(1, &BarRect, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, color, 0, 0);
-}
-
 void*(*CreateResourceFile)(const char* ResourceFileName, int32_t ResourceFileType, int, int, int);
 void(__fastcall *ResourceFileBeginLoading)(int a1, void* rsc, int a2);
 void LoadResourceFile(const char* ResourceFileName, int32_t ResourceFileType, int32_t nUnk1 = 0, int32_t nUnk2 = 0, int32_t nUnk3 = 0, int32_t nUnk4 = 0, int32_t nUnk5 = 0)
@@ -77,40 +72,34 @@ void LoadResourceFile(const char* ResourceFileName, int32_t ResourceFileType, in
     }
 };
 
-uint32_t* dword_73645C;
-uint8_t* byte_735768;
-void* off_71AA4C;
-void __declspec(naked) CmpShouldClearSurfaceDuring3DRender()
+// BlackMagazineFix: with motion blur or light trails the game draws the scene into a texture, and the magazine view's
+// background ends up black. The effects are switched off while a magazine is shown and back on when it closes: the
+// game rebuilds its render targets for that by itself at the end of the frame (0x40B3F0), as after changing them in
+// the options.
+uint8_t* byte_735768; // Set while the magazine view is open
+namespace MagazineEffects
 {
-    _asm
+    uint32_t* pMotionBlur = nullptr;  //0x700E98
+    uint32_t* pLightTrails = nullptr; //0x700E9C
+    uint32_t savedMotionBlur = 0, savedLightTrails = 0;
+    bool bSaved = false;
+
+    void Update()
     {
-        mov eax, dword_73645C
-        cmp dword ptr [eax], 1
-        jne resume
-
-        // byte_735768 is set if the magazine view screen is open.
-        mov eax, byte_735768
-        cmp byte ptr [eax], 0
-
-        resume:
-        ret
-    }
-}
-
-void __declspec(naked) MaybeClearSurfaceDuringBackgroundRender()
-{
-    _asm
-    {
-        call CmpShouldClearSurfaceDuring3DRender
-        jz resume
-
-        // In case 3D rendering won't clear the render surface, it must
-        // be done during the 2D background rendering.
-        mov dword ptr [esp+4], 1
-
-        resume:
-        mov esi, off_71AA4C
-        ret
+        const bool magazine = *byte_735768 != 0;
+        if (magazine && !bSaved && (*pMotionBlur || *pLightTrails))
+        {
+            savedMotionBlur = *pMotionBlur;
+            savedLightTrails = *pLightTrails;
+            *pMotionBlur = *pLightTrails = 0;
+            bSaved = true;
+        }
+        else if (!magazine && bSaved)
+        {
+            *pMotionBlur = savedMotionBlur;
+            *pLightTrails = savedLightTrails;
+            bSaved = false;
+        }
     }
 }
 
@@ -588,6 +577,212 @@ HWND WINAPI CreateWindowExA_Hook_NFSU(DWORD dwExStyle, LPCSTR lpClassName, LPCST
     return retval;
 }
 
+// MSAA ([GRAPHICS]): the back buffer gets multisampling when the game creates its Direct3D 9 device. The game's
+// Direct3DCreate9 import is redirected and CreateDevice is hooked in the vtable of the Direct3D object it gets; the
+// device's own methods aren't hooked (the system's runtime keeps the device's vtable in the device and replaces it).
+// The game keeps the parameters it passed (with the multisampling now) and uses them again for every reset.
+namespace MSAA
+{
+    int nLevel = 0;
+
+    using Direct3DCreate9_t = IDirect3D9* (WINAPI*)(UINT);
+    using CreateDevice_t = HRESULT(STDMETHODCALLTYPE*)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
+    Direct3DCreate9_t Direct3DCreate9_Orig = nullptr;
+    CreateDevice_t CreateDevice_Orig = nullptr;
+    constexpr int CreateDevice_Index = 16; // IDirect3D9 vtable (d3d9.h order)
+
+    // With motion blur or light trails the game draws the scene into a texture (no multisampling in Direct3D 9) with
+    // the back buffer's depth buffer; with a multisampled one that breaks the depth test (buildings and cars could be
+    // seen through). Right after creating the device the game decides whether the hardware can do both effects: the
+    // jump to "yes" is removed, so they're off and greyed out in the options like on hardware without them.
+    uint8_t* pEffectsSupportedJump = nullptr; // jne in the check, 0x410C2C (NA)
+
+    // The highest level up to nLevel the card can do for the back buffer and the depth buffer; MSAA needs a discarded
+    // swap chain without a lockable back buffer, otherwise the game's parameters stay as they are
+    void Apply(IDirect3D9* d3d, UINT adapter, D3DDEVTYPE type, D3DPRESENT_PARAMETERS* pp)
+    {
+        if (pp->SwapEffect != D3DSWAPEFFECT_DISCARD || (pp->Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER))
+            return;
+
+        D3DFORMAT format = pp->BackBufferFormat;
+        if (format == D3DFMT_UNKNOWN) // Windowed: the desktop's format
+        {
+            D3DDISPLAYMODE mode = {};
+            if (FAILED(d3d->GetAdapterDisplayMode(adapter, &mode)))
+                return;
+            format = mode.Format;
+        }
+
+        for (int samples = nLevel; samples >= 2; --samples)
+        {
+            auto msType = static_cast<D3DMULTISAMPLE_TYPE>(samples);
+            if (FAILED(d3d->CheckDeviceMultiSampleType(adapter, type, format, pp->Windowed, msType, nullptr)))
+                continue;
+            if (pp->EnableAutoDepthStencil && FAILED(d3d->CheckDeviceMultiSampleType(adapter, type, pp->AutoDepthStencilFormat, pp->Windowed, msType, nullptr)))
+                continue;
+            pp->MultiSampleType = msType;
+            pp->MultiSampleQuality = 0;
+            return;
+        }
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateDevice_Hook(IDirect3D9* d3d, UINT adapter, D3DDEVTYPE type, HWND window, DWORD flags, D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** device)
+    {
+        if (!pp)
+            return CreateDevice_Orig(d3d, adapter, type, window, flags, pp, device);
+
+        D3DPRESENT_PARAMETERS original = *pp;
+        Apply(d3d, adapter, type, pp);
+        HRESULT hr = CreateDevice_Orig(d3d, adapter, type, window, flags, pp, device);
+        if (FAILED(hr) && pp->MultiSampleType != original.MultiSampleType)
+        {
+            // Not possible after all: as the game wanted it
+            *pp = original;
+            hr = CreateDevice_Orig(d3d, adapter, type, window, flags, pp, device);
+        }
+        if (SUCCEEDED(hr) && pp->MultiSampleType != D3DMULTISAMPLE_NONE)
+            injector::MakeNOP(pEffectsSupportedJump, 2, true);
+        return hr;
+    }
+
+    IDirect3D9* WINAPI Direct3DCreate9_Hook(UINT sdkVersion)
+    {
+        IDirect3D9* d3d = Direct3DCreate9_Orig(sdkVersion);
+        if (d3d)
+        {
+            auto entry = &(*reinterpret_cast<void***>(d3d))[CreateDevice_Index];
+            if (*entry != reinterpret_cast<void*>(&CreateDevice_Hook))
+            {
+                CreateDevice_Orig = reinterpret_cast<CreateDevice_t>(*entry);
+                injector::WriteMemory(entry, reinterpret_cast<void*>(&CreateDevice_Hook), true);
+            }
+        }
+        return d3d;
+    }
+
+    // The game's import of Direct3DCreate9 (in the import table of every exe version)
+    void** FindImport()
+    {
+        auto base = reinterpret_cast<uint8_t*>(GetModuleHandle(NULL));
+        auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!dir.VirtualAddress)
+            return nullptr;
+        HMODULE d3d9 = GetModuleHandleA("d3d9.dll");
+        auto loaded = d3d9 ? reinterpret_cast<uintptr_t>(GetProcAddress(d3d9, "Direct3DCreate9")) : 0;
+        for (auto desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); desc->Name; ++desc)
+        {
+            if (_stricmp(reinterpret_cast<char*>(base + desc->Name), "d3d9.dll") != 0)
+                continue;
+            auto funcs = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk);
+            if (!desc->OriginalFirstThunk)
+            {
+                // No name list: the entry that holds the loaded function
+                for (; funcs->u1.Function; ++funcs)
+                    if (loaded && funcs->u1.Function == loaded)
+                        return reinterpret_cast<void**>(&funcs->u1.Function);
+                continue;
+            }
+            auto names = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->OriginalFirstThunk);
+            for (; names->u1.AddressOfData; ++names, ++funcs)
+            {
+                if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal))
+                    continue;
+                auto byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+                if (strcmp(reinterpret_cast<char*>(byName->Name), "Direct3DCreate9") == 0)
+                    return reinterpret_cast<void**>(&funcs->u1.Function);
+            }
+        }
+        return nullptr;
+    }
+
+    void Install(int level)
+    {
+        nLevel = std::clamp(level, 0, 16);
+        if (nLevel < 2)
+            return;
+
+        // Without a way to switch the effects off, no MSAA (the picture would break with them)
+        auto pattern = hook::pattern("39 15 ? ? ? ? 89 0D ? ? ? ? 75 0F 5F 89 15 ? ? ? ? 89 15 ? ? ? ? 5E C3 5F 89 35");
+        if (pattern.size() != 1)
+            return;
+        pEffectsSupportedJump = pattern.get_first<uint8_t>(12);
+
+        void** import = FindImport();
+        if (!import || !*import)
+            return;
+        Direct3DCreate9_Orig = reinterpret_cast<Direct3DCreate9_t>(*import);
+        injector::WriteMemory(import, reinterpret_cast<void*>(&Direct3DCreate9_Hook), true);
+    }
+}
+
+// The gamepad's right stick, read directly: the game hands over the axes of the device it takes for the frontend,
+// which with a second one plugged in (e.g. a joystick) isn't always the gamepad. Of all XInput controllers that report
+// themselves as gamepads the one whose right stick is pushed furthest (another idle one would read 0);
+// XInput9_1_0.dll is part of Windows since Vista, loaded on first use.
+namespace XInputRightStick
+{
+    using XInputGetState_t = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+    using XInputGetCapabilities_t = DWORD(WINAPI*)(DWORD, DWORD, XINPUT_CAPABILITIES*);
+    XInputGetState_t pGetState = nullptr;
+    XInputGetCapabilities_t pGetCapabilities = nullptr;
+
+    // Axes as the game's: [-10000, 10000], y down. False without such a gamepad (the caller keeps the game's values).
+    bool Read(int32_t& x, int32_t& y)
+    {
+        static bool loaded = false;
+        static bool gamepad[XUSER_MAX_COUNT] = {};
+        static DWORD nextSearch = 0;
+        if (!loaded)
+        {
+            loaded = true;
+            if (HMODULE xinput = LoadLibraryA("XInput9_1_0.dll"))
+            {
+                pGetState = reinterpret_cast<XInputGetState_t>(GetProcAddress(xinput, "XInputGetState"));
+                pGetCapabilities = reinterpret_cast<XInputGetCapabilities_t>(GetProcAddress(xinput, "XInputGetCapabilities"));
+            }
+        }
+        if (!pGetState || !pGetCapabilities)
+            return false;
+
+        // Asking unplugged slots is slow: which slots hold a gamepad is looked up again at most every 2 s
+        const DWORD now = GetTickCount();
+        if (now >= nextSearch)
+        {
+            nextSearch = now + 2000;
+            for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i)
+            {
+                XINPUT_CAPABILITIES caps = {};
+                gamepad[i] = pGetCapabilities(i, XINPUT_FLAG_GAMEPAD, &caps) == ERROR_SUCCESS && caps.SubType == XINPUT_DEVSUBTYPE_GAMEPAD;
+            }
+        }
+
+        bool found = false;
+        int best = -1;
+        for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i)
+        {
+            XINPUT_STATE state = {};
+            if (!gamepad[i])
+                continue;
+            if (pGetState(i, &state) != ERROR_SUCCESS)
+            {
+                gamepad[i] = false; // Unplugged
+                continue;
+            }
+            const int deflection = (std::max)(std::abs(static_cast<int>(state.Gamepad.sThumbRX)), std::abs(static_cast<int>(state.Gamepad.sThumbRY)));
+            if (deflection > best)
+            {
+                best = deflection;
+                x = state.Gamepad.sThumbRX * 10000 / 32767;
+                y = -state.Gamepad.sThumbRY * 10000 / 32767;
+                found = true;
+            }
+        }
+        return found;
+    }
+}
+
 // The ini reader's ReadInteger throws on an empty or non-number value (std::stoi), which crashed the game at start
 // ("FixHUD =" without a value): such a value counts as missing
 static int ReadIniInteger(CIniReader& ini, const char* section, const char* key, int defaultValue)
@@ -618,7 +813,7 @@ void Init()
     static int nImproveGamepadSupport = ReadIniInteger(iniReader, "MISC", "ImproveGamepadSupport", 0);
     static float fLeftStickDeadzone = iniReader.ReadFloat("MISC", "LeftStickDeadzone", 0.0f);
     static int nFPSLimit = ReadIniInteger(iniReader, "MISC", "FPSLimit", 0);
-    int nHideDebugObjects = ReadIniInteger(iniReader, "MISC", "HideDebugObjects", 0);
+    int nHideDebugObjects = ReadIniInteger(iniReader, "MISC", "HideDebugObjects", 1);
     bool bClipFrontend = ReadIniInteger(iniReader, "MISC", "ClipFrontend", 1) != 0;
     if (!bFixHUD)
     {
@@ -627,11 +822,15 @@ void Init()
         bHUDWidescreenMode = false;
         bClipFrontend = false;
     }
-    bool bBlackMagazineFix = ReadIniInteger(iniReader, "MISC", "BlackMagazineFix", 0) != 0;
+    bool bBlackMagazineFix = ReadIniInteger(iniReader, "MISC", "BlackMagazineFix", 1) != 0;
     bool bSaveKeyboardBindings = ReadIniInteger(iniReader, "MISC", "SaveKeyboardBindings", 1) != 0;
     if (szCustomUserFilesDirectoryInGameDir.empty() || szCustomUserFilesDirectoryInGameDir == "0")
         szCustomUserFilesDirectoryInGameDir.clear();
     int nWindowedMode = ReadIniInteger(iniReader, "MISC", "WindowedMode", 0);
+    std::string szLanguage = iniReader.ReadString("MISC", "Language", "");
+    if (szLanguage == "0")
+        szLanguage.clear();
+    MSAA::Install(ReadIniInteger(iniReader, "GRAPHICS", "MSAA", 0));
 
     if (!Screen.nWidth || !Screen.nHeight)
         std::tie(Screen.nWidth, Screen.nHeight) = GetDesktopRes();
@@ -1016,6 +1215,34 @@ void Init()
     if (bShowLangSelect && !hook::pattern("4C 41 4E 47 55 41 47 45 53 5C 52 55 53 53 49 41 4E 2E 42 49 4E").empty())
         bShowLangSelect = false;
 
+    // The game takes its language from the registry (Language under HKLM\Software\EA Games\Need For Speed Underground
+    // or ...\NFS Underground, 0x401190), without it
+    // English. Language in the ini (a name from the game's language table) is used instead of the registry; without
+    // it the Russian SoftClub release (its table has "Russian") starts in Russian when the registry has none.
+    if (auto language = hook::pattern("8B 0C 85 ? ? ? ? 89 0D ? ? ? ? EB 06 89 3D ? ? ? ? 8D 54 24 14"); !language.empty()) //0x401386 (RU 0x400796)
+    {
+        auto table = reinterpret_cast<const uint32_t*>(*language.get_first<uintptr_t>(3) - 4); // name, language, region
+        auto pLanguage = *language.get_first<uint32_t*>(9);
+        auto Find = [table](const char* name) -> const uint32_t*
+        {
+            for (auto entry = table; entry[0]; entry += 3)
+                if (_stricmp(reinterpret_cast<const char*>(entry[0]), name) == 0)
+                    return entry;
+            return nullptr;
+        };
+        if (auto entry = szLanguage.empty() ? nullptr : Find(szLanguage.c_str()))
+        {
+            *pLanguage = entry[1];
+            injector::MakeNOP(language.get_first(7), 6, true);  // mov [language], ecx: the registry's
+            injector::MakeNOP(language.get_first(15), 6, true); // mov [language], edi: 0 without a Language value
+        }
+        else if (auto russian = Find("Russian"))
+        {
+            *pLanguage = russian[1];
+            injector::MakeNOP(language.get_first(15), 6, true);
+        }
+    }
+
     if (bSkipIntro)
     {
         // patch bootflow
@@ -1159,10 +1386,49 @@ void Init()
         // Right stick turns the car in the menus like dragging with the mouse: a movement per frame in the orbit values
         // while the orbit is "held". The car view checks the mouse button for that, but the frontend reads the same
         // button as a click (sound), so the car view's check also takes the stick (the button itself isn't touched).
+        // Worked out there, once a frame: the pad callback below runs once per device, and with a second one plugged
+        // in its call came right after the gamepad's and overwrote the movement with none.
         static uint8_t* pOrbitMouseHeld = nullptr; //0x7064B0
         static int32_t* pOrbitDelta = nullptr;     //0x7064A4 (x), +4 (y)
         static bool bOrbitStick = false;
         static uintptr_t OrbitNotHeld = 0;
+        static int32_t nGameStickX = 0, nGameStickY = 0; // The game's right stick axes, of the device pushed furthest
+
+        // Right stick: [-10000, 10000], dead zone 20 %, full deflection 300 frontend pixels (480 high) a second
+        static auto OrbitStick = []()
+        {
+            static DWORD lastTick = 0;
+            static float restX = 0.0f, restY = 0.0f;
+            const DWORD now = GetTickCount();
+            const float seconds = (lastTick && now > lastTick) ? (std::min)((now - lastTick) / 1000.0f, 0.1f) : 0.0f;
+            lastTick = now;
+            auto shape = [](int32_t axis) {
+                const float v = std::clamp(axis / 10000.0f, -1.0f, 1.0f);
+                const float a = std::fabs(v);
+                return (a <= 0.2f) ? 0.0f : std::copysign((a - 0.2f) / 0.8f, v);
+            };
+            int32_t axisX = nGameStickX, axisY = nGameStickY;
+            nGameStickX = nGameStickY = 0;
+            XInputRightStick::Read(axisX, axisY);
+            const float x = shape(axisX), y = shape(axisY);
+            if (x != 0.0f || y != 0.0f)
+            {
+                restX += x * 300.0f * seconds;
+                restY += y * 300.0f * seconds;
+                const int32_t dx = static_cast<int32_t>(restX), dy = static_cast<int32_t>(restY);
+                restX -= dx;
+                restY -= dy;
+                pOrbitDelta[0] = dx;
+                pOrbitDelta[1] = dy;
+                bOrbitStick = true;
+            }
+            else if (bOrbitStick)
+            {
+                pOrbitDelta[0] = pOrbitDelta[1] = 0;
+                restX = restY = 0.0f;
+                bOrbitStick = false;
+            }
+        };
         if (auto orbit = hook::pattern("38 1D ? ? ? ? 74 76 8B 0D"); !orbit.empty()) //0x4B0CB9: cmp [mouse button], bl / je
         {
             pOrbitMouseHeld = *orbit.get_first<uint8_t*>(2);
@@ -1172,6 +1438,7 @@ void Init()
             {
                 void operator()(injector::reg_pack& regs)
                 {
+                    OrbitStick();
                     const bool held = *pOrbitMouseHeld != static_cast<uint8_t>(regs.ebx) || bOrbitStick;
                     if (!held)
                         *(uint32_t*)(regs.esp - 4) = OrbitNotHeld;
@@ -1266,37 +1533,11 @@ void Init()
                     else
                         Cstate = false;
 
-                    // Right stick: [-10000, 10000], dead zone 20 %, full deflection 300 frontend pixels (480 high) a second
-                    if (pOrbitDelta)
+                    // For OrbitStick: the furthest pushed of all devices this frame
+                    if (std::abs(PadKeyPresses->RSAxis1) + std::abs(PadKeyPresses->RSAxis2) > std::abs(nGameStickX) + std::abs(nGameStickY))
                     {
-                        static DWORD lastTick = 0;
-                        static float restX = 0.0f, restY = 0.0f;
-                        const DWORD now = GetTickCount();
-                        const float seconds = (lastTick && now > lastTick) ? (std::min)((now - lastTick) / 1000.0f, 0.1f) : 0.0f;
-                        lastTick = now;
-                        auto shape = [](int32_t axis) {
-                            const float v = std::clamp(axis / 10000.0f, -1.0f, 1.0f);
-                            const float a = std::fabs(v);
-                            return (a <= 0.2f) ? 0.0f : std::copysign((a - 0.2f) / 0.8f, v);
-                        };
-                        const float x = shape(PadKeyPresses->RSAxis1), y = shape(PadKeyPresses->RSAxis2);
-                        if (x != 0.0f || y != 0.0f)
-                        {
-                            restX += x * 300.0f * seconds;
-                            restY += y * 300.0f * seconds;
-                            const int32_t dx = static_cast<int32_t>(restX), dy = static_cast<int32_t>(restY);
-                            restX -= dx;
-                            restY -= dy;
-                            pOrbitDelta[0] = dx;
-                            pOrbitDelta[1] = dy;
-                            bOrbitStick = true;
-                        }
-                        else if (bOrbitStick)
-                        {
-                            pOrbitDelta[0] = pOrbitDelta[1] = 0;
-                            restX = restY = 0.0f;
-                            bOrbitStick = false;
-                        }
+                        nGameStickX = PadKeyPresses->RSAxis1;
+                        nGameStickY = PadKeyPresses->RSAxis2;
                     }
                 }
                 else if (nGameState != 3 && bOrbitStick)
@@ -1489,36 +1730,12 @@ void Init()
         }; injector::MakeInline<DeadzoneHook>(pattern.get_first(-2), pattern.get_first(4));
     }
 
-    // Pillarboxing needs the EndScene spot, which isn't there in the Russian SoftClub exe; remove the objects instead
-    if (nHideDebugObjects == 2 && hook::pattern("A1 ? ? ? ? 8B 08 83 C4 04 50").empty())
-        nHideDebugObjects = 1;
-
     {
-        if (nHideDebugObjects == 2)
-        {
-            //D3D9 EndScene Hook
-            pattern = hook::pattern("A1 ? ? ? ? 8B 08 83 C4 04 50");
-            static LPDIRECT3DDEVICE9* pDevice = *pattern.get_first<LPDIRECT3DDEVICE9*>(1);
-            struct EndSceneHook
-            {
-                void operator()(injector::reg_pack& regs)
-                {
-                    regs.eax = *(uint32_t*)pDevice;
-                    regs.ecx = *(uint32_t*)(regs.eax);
-
-                    if (nGameState == 3)
-                    {
-                        DrawRect(*pDevice, 0, 0, static_cast<int32_t>(Screen.fHudOffsetReal), Screen.nHeight);
-                        DrawRect(*pDevice, static_cast<int32_t>(Screen.fWidth43 + Screen.fHudOffsetReal), 0, static_cast<int32_t>(Screen.fWidth43 + Screen.fHudOffsetReal + Screen.fHudOffsetReal), Screen.nHeight);
-                    }
-                }
-            }; injector::MakeInline<EndSceneHook>(pattern.get_first(0), pattern.get_first(7));
-        }
         // The FE message hook also hides the fixed resolution's arrows, so it's always installed; the dev objects only
-        // with HideDebugObjects = 1
+        // with HideDebugObjects (2, the former pillarboxing, counts as 1)
         {
             using namespace DebugTags;
-            bDevObjects = (nHideDebugObjects == 1);
+            bDevObjects = (nHideDebugObjects != 0);
             
             FEngSetInvisible_Addr = static_cast<decltype(FEngSetInvisible_Addr)>(injector::GetBranchDestination(hook::get_pattern("E8 ? ? ? ? 8A 43 61"))); //0x000495F70;
             FEHashUpper_Addr = static_cast<decltype(FEHashUpper_Addr)>(injector::GetBranchDestination(hook::get_pattern("E8 ? ? ? ? 8B 75 6C"))); //0x004FD230;
@@ -1614,23 +1831,21 @@ void Init()
         }
     }
 
-    // Not available in the Russian SoftClub exe (the background render spot differs)
-    if (bBlackMagazineFix && (hook::pattern("8B F8 A0 ? ? ? ? 84 C0 0F 85").empty() || hook::pattern("83 3D ? ? ? ? 01 8B 77 58").empty() || hook::pattern("6A 00 BE ? ? ? ? 74 ? BE").empty()))
-        bBlackMagazineFix = false;
-
-    if (bBlackMagazineFix)
+    auto magazineOpen = hook::pattern("8B F8 A0 ? ? ? ? 84 C0 0F 85");
+    auto optionsCheck = hook::pattern("8B 0D ? ? ? ? 56 33 F6 33 C0 3B CE 57 BF 01 00 00 00 75 26 39 35 ? ? ? ? 75 1E");
+    if (bBlackMagazineFix && !magazineOpen.empty() && !optionsCheck.empty())
     {
-        pattern = hook::pattern("8B F8 A0 ? ? ? ? 84 C0 0F 85");
-        byte_735768 = *pattern.get_first<uint8_t*>(3);
-
-        pattern = hook::pattern("83 3D ? ? ? ? 01 8B 77 58");
-        dword_73645C = *pattern.get_first<uint32_t*>(2);
-        injector::MakeRangedNOP(pattern.get_first(0), pattern.get_first(7));
-        injector::MakeCALL(pattern.get_first(0), CmpShouldClearSurfaceDuring3DRender); // 4098A2
-
-        pattern = hook::pattern("6A 00 BE ? ? ? ? 74 ? BE");
-        off_71AA4C = *pattern.get_first<void*>(10);
-        injector::MakeCALL(pattern.get_first(9), MaybeClearSurfaceDuringBackgroundRender); // 409CF2
+        byte_735768 = *magazineOpen.get_first<uint8_t*>(3);
+        MagazineEffects::pMotionBlur = *optionsCheck.get_first<uint32_t*>(2);
+        MagazineEffects::pLightTrails = *optionsCheck.get_first<uint32_t*>(23);
+        struct OptionsCheckHook
+        {
+            void operator()(injector::reg_pack& regs)
+            {
+                MagazineEffects::Update();
+                regs.ecx = *MagazineEffects::pMotionBlur; // mov ecx, [motion blur]
+            }
+        }; injector::MakeInline<OptionsCheckHook>(optionsCheck.get_first(0), optionsCheck.get_first(6)); // 40B3F0
     }
 
     //__mbclen to strlen, "---" bug fix
