@@ -19,7 +19,7 @@ workspace "NFSUnderground.WidescreenFix-Legacy"
 
    defines { "rsc_CompanyName=\"ThirteenAG, Pelorojo\"" }
    defines { "rsc_LegalCopyright=\"MIT License\""}
-   defines { "rsc_FileVersion=\"1.4.0.0\"", "rsc_ProductVersion=\"1.4.0.0\"" }
+   defines { "rsc_FileVersion=\"1.5.0.0\"", "rsc_ProductVersion=\"1.5.0.0\"" }
    defines { "rsc_InternalName=\"%{prj.name}\"", "rsc_ProductName=\"%{prj.name} Legacy\"", "rsc_OriginalFilename=\"%{prj.name}.asi\"" }
    defines { "rsc_FileDescription=\"NFSUnderground.WidescreenFix Legacy (EU/SoftClub compatible)\"" }
    defines { "rsc_UpdateUrl=\"https://github.com/Pelorojo/NFSUnderground.WidescreenFix-Legacy\"" }
@@ -29,6 +29,7 @@ workspace "NFSUnderground.WidescreenFix-Legacy"
    files { "resources/*.rc" }
    files { "external/hooking/Hooking.Patterns.h", "external/hooking/Hooking.Patterns.cpp" }
    files { "includes/stdafx.h", "includes/stdafx.cpp" }
+   files { "external/miniz/miniz.h", "external/miniz/miniz.c" } -- zipped icon themes
    includedirs { "includes" }
    includedirs { "external/hooking" }
    includedirs { "external/injector/include" }
@@ -36,6 +37,8 @@ workspace "NFSUnderground.WidescreenFix-Legacy"
    includedirs { "external/spdlog/include" }
    includedirs { "external/filewatch" }
    includedirs { "external/modutils" }
+   includedirs { "external/stb" }   -- stb_image: PNG icons of the themes
+   includedirs { "external/miniz" }
 
    local dxsdk = os.getenv "DXSDK_DIR"
    if dxsdk then

@@ -7,6 +7,12 @@
 #include <dinput.h>
 #include <xinput.h>
 #include <shlobj.h>
+#include <fstream>
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_NO_STDIO
+#include "stb_image.h"
+#include "miniz.h"
 
 struct Screen
 {
@@ -57,20 +63,6 @@ void LoadDatFile(std::string_view str, std::function<void(std::string_view line)
         CFileMgr::CloseFile(hFile);
     }
 }
-
-void*(*CreateResourceFile)(const char* ResourceFileName, int32_t ResourceFileType, int, int, int);
-void(__fastcall *ResourceFileBeginLoading)(int a1, void* rsc, int a2);
-void LoadResourceFile(const char* ResourceFileName, int32_t ResourceFileType, int32_t nUnk1 = 0, int32_t nUnk2 = 0, int32_t nUnk3 = 0, int32_t nUnk4 = 0, int32_t nUnk5 = 0)
-{
-    auto r = CreateResourceFile(ResourceFileName, ResourceFileType, nUnk1, nUnk2, nUnk3);
-    _asm
-    {
-        mov     edx, r
-        mov     ecx, nUnk5
-        mov     eax, nUnk4
-        call    ResourceFileBeginLoading
-    }
-};
 
 // BlackMagazineFix: with motion blur or light trails the game draws the scene into a texture, and the magazine view's
 // background ends up black. The effects are switched off while a magazine is shown and back on when it closes: the
@@ -148,6 +140,8 @@ namespace VinylColor
             Send();
     }
 }
+
+namespace IconThemes { void OnPackageMessage(const char* pkgname); }
 
 namespace DebugTags
 {
@@ -330,6 +324,7 @@ namespace DebugTags
             mov FEPkgMgr_SendMessageToPackage_ESI, esi
         }
         CorruptAllFEDevObjects(*(char**)(FEPkgMgr_SendMessageToPackage_ESI + 0xC));
+        IconThemes::OnPackageMessage(*(char**)(FEPkgMgr_SendMessageToPackage_ESI + 0xC));
         VinylColor::PollKeyboard();
         _asm
         {
@@ -783,6 +778,624 @@ namespace XInputRightStick
     }
 }
 
+// Icon themes ([MISC] GamepadTheme / KeyboardTheme): the game shows 11 key icons (textures PC_*), 8 of them have a pad
+// button. A theme is a folder or zip in scripts\buttons\gamepad|keyboard\ with a theme.ini ([Icons]: position or key =
+// PNG file; [Names] and [Names.<language code>]: button names in the controls menu) and its PNGs. Its icons go into a
+// texture pack of their own built in memory (names of their own: a pack with the game's names doesn't win against the
+// game's packs) and loaded with the game's chunk loader; the menus' image objects that show a PC_* texture are then
+// pointed to them. Missing icons stay the original ones, missing names the Xbox ones.
+namespace IconThemes
+{
+    // bStringHash, the hash the game uses for texture names
+    uint32_t Hash(const char* str)
+    {
+        uint32_t result = 0xFFFFFFFF;
+        for (; *str; ++str)
+            result = static_cast<uint8_t>(*str) + 33 * result;
+        return result;
+    }
+
+    // The game's key icons: texture, key in a keyboard theme, position in a gamepad theme (nullptr = keyboard only)
+    struct KeyIcon { const char* texture; const char* key; const char* pad; };
+    constexpr KeyIcon KeyIcons[] =
+    {
+        { "PC_X",           "Enter",     "A"    },
+        { "PC_BACK",        "Backspace", "B"    },
+        { "PC_PERFORMANCE", "P",         "X"    },
+        { "PC_CREATEROOM",  "Z",         "Y"    },
+        { "PC_CUSTOM",      "C",         "View" },
+        { "PC_TUTORIAL",    "T",         "LS"   },
+        { "PC_DELETE",      "D",         "RS"   },
+        { "PC_QUIT",        "Q",         "Quit" },
+        { "PC_AGREEMENT",   "A",         nullptr },
+        { "PC_HELP",        "H",         nullptr },
+        { "PC_RACEOP",      "R",         nullptr },
+    };
+
+    // Controls menu names, in the order of the game's button numbers 0-9, then d-pad, axes, triggers, POV, Share
+    constexpr const char* NameKeys[] = { "A", "B", "X", "Y", "LB", "RB", "View", "Menu", "LS", "RS", "DPadUp", "DPadDown",
+        "DPadLeft", "DPadRight", "RStickX", "RStickY", "LStickX", "LStickY", "Triggers", "DPad", "Share" };
+
+    struct Image { int size = 0; std::vector<uint8_t> rgba; };
+    using Section = std::map<std::string, std::string>;
+
+    struct Theme
+    {
+        std::map<std::string, Section> ini;         // section (lower case) -> key (lower case) -> value
+        std::map<std::string, std::vector<uint8_t>> files; // file name (lower case) -> contents
+    };
+
+    std::string Lower(std::string s)
+    {
+        for (auto& c : s)
+            c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        return s;
+    }
+
+    std::string Trim(const std::string& s)
+    {
+        size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
+        return a == std::string::npos ? "" : s.substr(a, b - a + 1);
+    }
+
+    void ParseIni(const std::vector<uint8_t>& data, Theme& theme)
+    {
+        std::string text(data.begin(), data.end());
+        if (text.compare(0, 3, "\xEF\xBB\xBF") == 0) // UTF-8 BOM
+            text.erase(0, 3);
+        std::string section;
+        size_t pos = 0;
+        while (pos < text.size())
+        {
+            size_t end = text.find('\n', pos);
+            std::string line = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            pos = end == std::string::npos ? text.size() : end + 1;
+            if (size_t comment = line.find(';'); comment != std::string::npos)
+                line.erase(comment);
+            line = Trim(line);
+            if (line.empty())
+                continue;
+            if (line.front() == '[' && line.back() == ']')
+                section = Lower(Trim(line.substr(1, line.size() - 2)));
+            else if (size_t eq = line.find('='); eq != std::string::npos)
+                theme.ini[section][Lower(Trim(line.substr(0, eq)))] = Trim(line.substr(eq + 1));
+        }
+    }
+
+    bool ReadFile(const std::wstring& path, std::vector<uint8_t>& data)
+    {
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+            return false;
+        data.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+        return true;
+    }
+
+    // scripts\buttons\<kind>\<name>\ (wins) or <name>.zip, whose files may also sit in one folder inside it
+    bool LoadTheme(const std::string& kind, const std::string& name, Theme& theme)
+    {
+        if (name.empty() || Lower(name) == "original")
+            return false;
+        std::wstring base = GetThisModulePath<std::wstring>() + L"buttons\\" + std::wstring(kind.begin(), kind.end()) + L"\\";
+        std::wstring wname(name.begin(), name.end());
+
+        std::error_code ec;
+        std::filesystem::path folder = base + wname;
+        if (std::filesystem::is_directory(folder, ec))
+        {
+            for (auto& entry : std::filesystem::directory_iterator(folder, ec))
+            {
+                std::vector<uint8_t> data;
+                if (entry.is_regular_file(ec) && ReadFile(entry.path().wstring(), data))
+                    theme.files[Lower(entry.path().filename().string())] = std::move(data);
+            }
+        }
+        else
+        {
+            std::vector<uint8_t> zipData;
+            if (!ReadFile(base + wname + L".zip", zipData))
+                return false;
+            mz_zip_archive zip = {};
+            if (!mz_zip_reader_init_mem(&zip, zipData.data(), zipData.size(), 0))
+                return false;
+            for (mz_uint i = 0; i < mz_zip_reader_get_num_files(&zip); i++)
+            {
+                mz_zip_archive_file_stat stat;
+                if (!mz_zip_reader_file_stat(&zip, i, &stat) || stat.m_is_directory)
+                    continue;
+                std::string path = stat.m_filename;
+                std::string file = path.substr(path.find_last_of("/\\") + 1);
+                size_t size = 0;
+                if (void* p = mz_zip_reader_extract_to_heap(&zip, i, &size, 0))
+                {
+                    theme.files[Lower(file)].assign(static_cast<uint8_t*>(p), static_cast<uint8_t*>(p) + size);
+                    mz_free(p);
+                }
+            }
+            mz_zip_reader_end(&zip);
+        }
+
+        auto ini = theme.files.find("theme.ini");
+        if (ini == theme.files.end())
+            return false;
+        ParseIni(ini->second, theme);
+        return true;
+    }
+
+    // The theme's [Theme] Zoom: > 1 makes its icons bigger (cuts the margin around them), < 1 smaller
+    double Zoom(const Theme& theme)
+    {
+        auto section = theme.ini.find("theme");
+        if (section == theme.ini.end())
+            return 1.0;
+        auto zoom = section->second.find("zoom");
+        if (zoom == section->second.end())
+            return 1.0;
+        double value = strtod(zoom->second.c_str(), nullptr);
+        return (value >= 0.25 && value <= 4.0) ? value : 1.0;
+    }
+
+    // Averages pixels by the share of them that's covered, colors also weighted by their alpha, so transparent pixels
+    // don't darken the edges
+    struct Average
+    {
+        double color[3] = {}, alpha = 0, weight = 0;
+        void Add(const uint8_t* p, double share = 1.0)
+        {
+            for (int c = 0; c < 3; c++)
+                color[c] += p[c] * p[3] * share;
+            alpha += p[3] * share;
+            weight += share;
+        }
+        void AddTransparent(double share) { weight += share; }
+        void Store(uint8_t* p) const
+        {
+            for (int c = 0; c < 3; c++)
+                p[c] = alpha > 0 ? uint8_t((std::min)(255.0, color[c] / alpha + 0.5)) : 0;
+            p[3] = weight > 0 ? uint8_t((std::min)(255.0, alpha / weight + 0.5)) : 0;
+        }
+    };
+
+    // Scales the area (sx, sy, sw, sh) of an RGBA image (w x h; outside of it transparent) to (dx, dy, dw, dh) of a
+    // square one: each target pixel averages the source pixels it covers, by the share of them it covers
+    void Resample(const uint8_t* src, int w, int h, double sx, double sy, double sw, double sh, Image& dst, int dx, int dy, int dw, int dh)
+    {
+        for (int y = 0; y < dh; y++)
+        {
+            double fy0 = sy + y * sh / dh, fy1 = sy + (y + 1) * sh / dh;
+            for (int x = 0; x < dw; x++)
+            {
+                double fx0 = sx + x * sw / dw, fx1 = sx + (x + 1) * sw / dw;
+                Average average;
+                for (int py = int(floor(fy0)); py < fy1; py++)
+                {
+                    double shareY = (std::min)(fy1, py + 1.0) - (std::max)(fy0, double(py));
+                    for (int px = int(floor(fx0)); px < fx1; px++)
+                    {
+                        double share = shareY * ((std::min)(fx1, px + 1.0) - (std::max)(fx0, double(px)));
+                        if (px >= 0 && px < w && py >= 0 && py < h)
+                            average.Add(&src[(size_t(py) * w + px) * 4], share);
+                        else
+                            average.AddTransparent(share);
+                    }
+                }
+                average.Store(&dst.rgba[(size_t(dy + y) * dst.size + dx + x) * 4]);
+            }
+        }
+    }
+
+    // Square, a power of two from 16 to 128, RGBA. Only scaled down (by the area each pixel covers), so the part of
+    // the image that is shown decides the size: a 64x64 icon with Zoom 1.15 becomes 32x32, a 128x128 one 64x64
+    bool DecodeImage(const Theme& theme, const std::string& file, Image& image)
+    {
+        auto it = theme.files.find(Lower(file));
+        if (it == theme.files.end())
+            return false;
+        int w = 0, h = 0, n = 0;
+        stbi_uc* pixels = stbi_load_from_memory(it->second.data(), int(it->second.size()), &w, &h, &n, 4);
+        if (!pixels)
+            return false;
+        // The centered part of the image that is shown (bigger than the image with a zoom below 1, transparent around)
+        double zoom = Zoom(theme);
+        double sw = w / zoom, sh = h / zoom, ox = (w - sw) / 2, oy = (h - sh) / 2;
+        int size = 16;
+        while (size * 2 <= (std::min)(sw, sh) && size < 128)
+            size *= 2;
+        image.size = size;
+        image.rgba.resize(size_t(size) * size * 4);
+        Resample(pixels, w, h, ox, oy, sw, sh, image, 0, 0, size, size);
+        stbi_image_free(pixels);
+        return true;
+    }
+
+    Image Half(const Image& image)
+    {
+        Image half;
+        half.size = image.size / 2;
+        half.rgba.resize(size_t(half.size) * half.size * 4);
+        for (int y = 0; y < half.size; y++)
+            for (int x = 0; x < half.size; x++)
+            {
+                Average average;
+                for (int dy = 0; dy < 2; dy++)
+                    for (int dx = 0; dx < 2; dx++)
+                        average.Add(&image.rgba[(size_t(y * 2 + dy) * image.size + x * 2 + dx) * 4]);
+                average.Store(&half.rgba[(size_t(y) * half.size + x) * 4]);
+            }
+        return half;
+    }
+
+    // Quit without an icon of its own: the LS and RS icons side by side, without the empty margins around them, as
+    // big as fits with the margin of the icons
+    Image SideBySide(const Image& left, const Image& right)
+    {
+        struct Box { int x0, y0, x1, y1; };
+        auto bounds = [](const Image& image) // of what isn't transparent
+        {
+            Box box = { image.size, image.size, 0, 0 };
+            for (int y = 0; y < image.size; y++)
+                for (int x = 0; x < image.size; x++)
+                    if (image.rgba[(size_t(y) * image.size + x) * 4 + 3])
+                        box = { (std::min)(box.x0, x), (std::min)(box.y0, y), (std::max)(box.x1, x + 1), (std::max)(box.y1, y + 1) };
+            if (box.x1 <= box.x0)
+                box = { 0, 0, image.size, image.size };
+            return box;
+        };
+        Box l = bounds(left), r = bounds(right);
+        int size = left.size;
+        int margin = (std::min)({ l.x0, l.y0, size - l.x1, size - l.y1, r.x0, r.y0, size - r.x1, size - r.y1 });
+        double gap = size / 16.0;
+        double width = (l.x1 - l.x0) + gap + (r.x1 - r.x0), height = (std::max)(l.y1 - l.y0, r.y1 - r.y0);
+        double scale = (std::min)((size - 2 * margin) / width, (size - 2 * margin) / height);
+
+        Image image;
+        image.size = size;
+        image.rgba.assign(size_t(size) * size * 4, 0);
+        int lw = int(lround((l.x1 - l.x0) * scale)), rw = int(lround((r.x1 - r.x0) * scale));
+        int lh = int(lround((l.y1 - l.y0) * scale)), rh = int(lround((r.y1 - r.y0) * scale));
+        int x = (size - (lw + int(lround(gap * scale)) + rw)) / 2;
+        Resample(left.rgba.data(), size, size, l.x0, l.y0, l.x1 - l.x0, l.y1 - l.y0, image, x, (size - lh) / 2, lw, lh);
+        Resample(right.rgba.data(), size, size, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0, image, size - x - rw, (size - rh) / 2, rw, rh);
+        return image;
+    }
+
+    // Fully transparent pixels get the color of their visible neighbors (spreading outwards), not black: the game
+    // filters between pixels when drawing, and their color would show as a dark edge around the icon
+    void Bleed(Image& image)
+    {
+        int size = image.size;
+        std::vector<uint8_t> known(size_t(size) * size);
+        for (size_t i = 0; i < known.size(); i++)
+            known[i] = image.rgba[i * 4 + 3] != 0;
+        for (bool changed = true; changed;)
+        {
+            changed = false;
+            std::vector<uint8_t> next = known;
+            for (int y = 0; y < size; y++)
+                for (int x = 0; x < size; x++)
+                {
+                    size_t i = size_t(y) * size + x;
+                    if (known[i])
+                        continue;
+                    uint32_t sum[3] = {}, count = 0;
+                    for (int ny = (std::max)(0, y - 1); ny <= (std::min)(size - 1, y + 1); ny++)
+                        for (int nx = (std::max)(0, x - 1); nx <= (std::min)(size - 1, x + 1); nx++)
+                            if (size_t n = size_t(ny) * size + nx; known[n])
+                            {
+                                for (int c = 0; c < 3; c++)
+                                    sum[c] += image.rgba[n * 4 + c];
+                                count++;
+                            }
+                    if (count)
+                    {
+                        for (int c = 0; c < 3; c++)
+                            image.rgba[i * 4 + c] = uint8_t(sum[c] / count);
+                        next[i] = 1;
+                        changed = true;
+                    }
+                }
+            known = std::move(next);
+        }
+    }
+
+    // A8R8G8B8 (BGRA in memory) with all mip levels
+    std::vector<uint8_t> Pixels(const Image& image, int& mips)
+    {
+        std::vector<uint8_t> data;
+        Image level = image;
+        mips = 0;
+        while (true)
+        {
+            Bleed(level);
+            for (size_t i = 0; i < level.rgba.size(); i += 4)
+            {
+                data.push_back(level.rgba[i + 2]);
+                data.push_back(level.rgba[i + 1]);
+                data.push_back(level.rgba[i + 0]);
+                data.push_back(level.rgba[i + 3]);
+            }
+            mips++;
+            if (level.size == 1)
+                break;
+            level = Half(level);
+        }
+        return data;
+    }
+
+    struct Texture { std::string name; uint32_t hash; int size; int mips; std::vector<uint8_t> pixels; };
+
+    // A texture pack (TPK version 4) laid out like the game's own
+    std::vector<uint8_t> BuildPack(std::vector<Texture> textures, const char* packName)
+    {
+        // The game looks textures up with a binary search over the hash list
+        std::sort(textures.begin(), textures.end(), [](const Texture& a, const Texture& b) { return a.hash < b.hash; });
+
+        std::vector<uint8_t> w;
+        auto put = [&](const void* p, size_t n) { w.insert(w.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
+        auto put32 = [&](uint32_t v) { put(&v, 4); };
+        auto begin = [&](uint32_t id) { put32(id); put32(0); return w.size(); };
+        auto end = [&](size_t start) { *reinterpret_cast<uint32_t*>(&w[start - 4]) = uint32_t(w.size() - start); };
+        auto align = [&](size_t alignment) // an empty chunk, so that the next chunk starts at a multiple of alignment
+        {
+            size_t padding = (alignment - (w.size() + 8) % alignment) % alignment;
+            put32(0); put32(uint32_t(padding)); w.insert(w.end(), padding, 0);
+        };
+        auto putString = [&](const char* s, size_t size) { std::vector<char> f(size, 0); strncpy_s(f.data(), size, s, _TRUNCATE); put(f.data(), size); };
+        uint32_t packHash = Hash(packName);
+
+        auto capsule = begin(0xB3300000);
+        align(0x40);
+        auto info = begin(0xB3310000);
+        {
+            auto header = begin(0x33310001);
+            put32(4); // version
+            putString(packName, 0x1C);
+            putString(packName, 0x40);
+            put32(packHash);
+            for (int i = 0; i < 6; i++)
+                put32(0);
+            end(header);
+
+            auto hashes = begin(0x33310002);
+            for (auto& t : textures)
+            {
+                put32(t.hash);
+                put32(0);
+            }
+            end(hashes);
+
+            auto infos = begin(0x33310004);
+            int32_t placement = 0;
+            for (auto& t : textures)
+            {
+                uint8_t e[0x7C] = {};
+                strncpy_s(reinterpret_cast<char*>(e + 0x0C), 24, t.name.c_str(), _TRUNCATE);
+                *reinterpret_cast<uint32_t*>(e + 0x24) = t.hash;
+                *reinterpret_cast<uint32_t*>(e + 0x28) = 0x1A93CF;              // class name hash
+                *reinterpret_cast<int32_t*>(e + 0x30) = placement;
+                *reinterpret_cast<int32_t*>(e + 0x38) = int32_t(t.pixels.size());
+                *reinterpret_cast<int32_t*>(e + 0x40) = t.size * t.size * 4;     // size of the top level
+                *reinterpret_cast<int16_t*>(e + 0x44) = int16_t(t.size);
+                *reinterpret_cast<int16_t*>(e + 0x46) = int16_t(t.size);
+                uint8_t shift = 0;
+                while ((1 << shift) < t.size)
+                    shift++;
+                e[0x48] = e[0x49] = shift;                                       // log2 width/height
+                e[0x4A] = 0x20;                                                  // uncompressed
+                e[0x4E] = uint8_t(t.mips);
+                e[0x51] = 5;                                                     // rendering order
+                e[0x55] = 2;                                                     // alpha usage
+                e[0x56] = 1;                                                     // alpha blend
+                *reinterpret_cast<int16_t*>(e + 0x62) = 0x100;                   // offset T
+                *reinterpret_cast<int16_t*>(e + 0x64) = 0x100;                   // scale S
+                put(e, sizeof(e));
+                placement += int32_t(t.pixels.size());
+            }
+            end(infos);
+
+            auto formats = begin(0x33310005);
+            for (size_t i = 0; i < textures.size(); i++)
+            {
+                uint32_t f[8] = { 0, 0, 0, 5, 6, 0x15 /* D3DFMT_A8R8G8B8 */, 0, 0 };
+                put(f, sizeof(f));
+            }
+            end(formats);
+        }
+        end(info);
+
+        align(0x80);
+        auto data = begin(0xB3320000);
+        {
+            auto link = begin(0x33320001);
+            put32(0); put32(0); put32(1); put32(packHash); put32(0); put32(0);
+            end(link);
+            align(0x80);
+            auto images = begin(0x33320002);
+            w.insert(w.end(), 0x78, 0x11); // the images start on a 0x80 boundary
+            for (auto& t : textures)
+                put(t.pixels.data(), t.pixels.size());
+            end(images);
+        }
+        end(data);
+        end(capsule);
+        return w;
+    }
+
+    Theme Pad, Keyboard;
+    bool bPadIcons = false;
+    std::vector<uint8_t> Pack;                       // built in Init, handed to the game with the first front end message
+    std::map<uint32_t, uint32_t> Redirect;           // PC_* texture hash -> theme texture hash
+    std::map<std::string, std::string> RedirectNames; // PC_* texture name -> theme texture name (for ButtonTexture)
+    char* (__cdecl* bMalloc)(int size, int debugName, int debugLine, int flags) = nullptr;
+    bool (__cdecl* LoadChunksFromMemory)(char** buffer, int* size, int allocFlags, const char* debugName) = nullptr;
+
+    void Install(const std::string& padTheme, bool padIcons, const std::string& keyboardTheme)
+    {
+        auto alloc = hook::pattern("57 57 50 E8 ? ? ? ? 8B 4C 24 ? 68 00 20 00 00"); //0x447DFE
+        auto loader = hook::pattern("57 E8 ? ? ? ? 8A 46 0C 83 C4 10 A8 04");         //0x4482A6
+        if (alloc.empty() || loader.empty())
+            return;
+        bMalloc = reinterpret_cast<decltype(bMalloc)>(injector::GetBranchDestination(alloc.get_first(3)).as_int());
+        LoadChunksFromMemory = reinterpret_cast<decltype(LoadChunksFromMemory)>(injector::GetBranchDestination(loader.get_first(1)).as_int());
+
+        bPadIcons = padIcons && LoadTheme("gamepad", padTheme, Pad);
+        bool keyboard = LoadTheme("keyboard", keyboardTheme, Keyboard);
+
+        std::vector<Texture> textures;
+        auto add = [&](const std::string& name, const Image& image)
+        {
+            Texture t;
+            t.name = name;
+            for (auto& c : t.name)
+                c = static_cast<char>(toupper(static_cast<unsigned char>(c))); // like the game's texture names
+            t.hash = Hash(t.name.c_str());
+            t.size = image.size;
+            t.pixels = Pixels(image, t.mips);
+            textures.push_back(std::move(t));
+            return textures.size() - 1;
+        };
+        auto icon = [](const Theme& theme, const char* key, Image& image)
+        {
+            auto section = theme.ini.find("icons");
+            if (section == theme.ini.end())
+                return false;
+            auto file = section->second.find(Lower(key));
+            return file != section->second.end() && DecodeImage(theme, file->second, image);
+        };
+
+        for (const auto& k : KeyIcons)
+        {
+            Image image;
+            size_t target = SIZE_MAX;
+            if (bPadIcons && k.pad)
+            {
+                if (icon(Pad, k.pad, image))
+                    target = add(std::string("WSF_PAD_") + k.pad, image);
+                else if (!strcmp(k.pad, "Quit"))
+                {
+                    Image ls, rs;
+                    if (icon(Pad, "LS", ls) && icon(Pad, "RS", rs) && ls.size == rs.size)
+                        target = add("WSF_PAD_QUIT", SideBySide(ls, rs));
+                }
+            }
+            if (target == SIZE_MAX && keyboard && icon(Keyboard, k.key, image))
+                target = add(std::string("WSF_KEY_") + k.key, image);
+            if (target != SIZE_MAX)
+            {
+                Redirect[Hash(k.texture)] = textures[target].hash;
+                RedirectNames[k.texture] = textures[target].name;
+            }
+        }
+        if (!textures.empty())
+            Pack = BuildPack(textures, "WSF_ICON_THEMES");
+    }
+
+    // The objects of a front end package (list at +0x40, a group's children at +0x60, next at +4, type at +0x18,
+    // texture hash at +0x24, flags at +0x1C) whose texture is one of the game's key icons get the theme's
+    void RedirectObjects(uintptr_t object)
+    {
+        for (; object; object = *reinterpret_cast<uintptr_t*>(object + 0x04))
+        {
+            uint32_t type = *reinterpret_cast<uint32_t*>(object + 0x18);
+            if (type == 5) // group
+                RedirectObjects(*reinterpret_cast<uintptr_t*>(object + 0x60));
+            else if (type == 1 || (type >= 9 && type <= 0xC)) // image kinds
+            {
+                auto& handle = *reinterpret_cast<uint32_t*>(object + 0x24);
+                if (auto it = Redirect.find(handle); it != Redirect.end())
+                {
+                    handle = it->second;
+                    *reinterpret_cast<uint32_t*>(object + 0x1C) |= 0x2400000;
+                }
+            }
+        }
+    }
+
+    // With every front end message: loads the pack once, then points the package's icons to it
+    void OnPackageMessage(const char* pkgname)
+    {
+        if (Redirect.empty() || !pkgname)
+            return;
+        if (!Pack.empty())
+        {
+            int size = int(Pack.size());
+            char* buffer = bMalloc(size, 0, 0, 0);
+            if (!buffer)
+                return;
+            memcpy(buffer, Pack.data(), Pack.size());
+            Pack.clear();
+            Pack.shrink_to_fit();
+            LoadChunksFromMemory(&buffer, &size, 0, "WSF_ICON_THEMES"); // the loader frees the buffer
+        }
+        if (uintptr_t pkg = DebugTags::FEPkgMgr_FindPackage(pkgname))
+            RedirectObjects(*reinterpret_cast<uintptr_t*>(pkg + 0x40));
+    }
+
+    // Language code of the game's active language (for [Names.<code>]), from its language table. The language the
+    // game set last (NA/EU 0x6EE6F0, RU 0x6EE778; the language menu sets it too), else the one from the registry
+    uint32_t* pLanguage = nullptr;
+    int32_t* pActiveLanguage = nullptr;
+    const uint32_t* pLanguageTable = nullptr; // name, language, region
+    std::string LanguageCode()
+    {
+        if (!pActiveLanguage)
+            if (auto set = hook::pattern("8B 0D ? ? ? ? 57 8B F8 3B F9 0F 84 ? ? ? ? 53 33 DB 83 F9 FF"); !set.empty()) //0x59FA20
+                pActiveLanguage = *set.get_first<int32_t*>(2);
+        uint32_t language = (pActiveLanguage && *pActiveLanguage != -1) ? uint32_t(*pActiveLanguage) : pLanguage ? *pLanguage : uint32_t(-1);
+        if (language == uint32_t(-1) || !pLanguageTable)
+            return "";
+        static const std::map<std::string, std::string> codes = { { "french", "fr" }, { "german", "de" }, { "italian", "it" },
+            { "spanish", "es" }, { "dutch", "nl" }, { "swedish", "sv" }, { "russian", "ru" }, { "korean", "ko" },
+            { "chinese (traditional)", "zh" }, { "japanese", "ja" } };
+        for (auto entry = pLanguageTable; entry[0]; entry += 3)
+        {
+            if (entry[1] == language)
+            {
+                auto it = codes.find(Lower(reinterpret_cast<const char*>(entry[0])));
+                return it != codes.end() ? it->second : "";
+            }
+        }
+        return "";
+    }
+
+    // The controls menu's button names: [Names.<code>], then [Names], then the given defaults
+    std::vector<std::wstring> Names(const std::vector<std::wstring>& defaults)
+    {
+        std::vector<std::wstring> names = defaults;
+        names.resize(std::size(NameKeys));
+        if (!bPadIcons)
+            return names;
+        std::string code = LanguageCode();
+        for (size_t i = 0; i < std::size(NameKeys); i++)
+        {
+            for (const std::string& section : { std::string("names.") + code, std::string("names") })
+            {
+                auto s = Pad.ini.find(section);
+                if (section == "names." || s == Pad.ini.end())
+                    continue;
+                auto value = s->second.find(Lower(NameKeys[i]));
+                if (value == s->second.end())
+                    continue;
+                wchar_t text[64] = {};
+                MultiByteToWideChar(CP_UTF8, 0, value->second.c_str(), -1, text, 64);
+                names[i] = text;
+                break;
+            }
+        }
+        return names;
+    }
+}
+
+// Tells other plugins which texture the menus show instead of one of the game's key icons (e.g. PC_CUSTOM ->
+// WSF_PAD_VIEW; the LapRecorder draws it at the vinyl color), the name itself when the theme has none for it
+extern "C" __declspec(dllexport) const char* ButtonTexture(const char* name)
+{
+    if (!name)
+        return name;
+    auto it = IconThemes::RedirectNames.find(name);
+    return it != IconThemes::RedirectNames.end() ? it->second.c_str() : name;
+}
+
 // The ini reader's ReadInteger throws on an empty or non-number value (std::stoi), which crashed the game at start
 // ("FixHUD =" without a value): such a value counts as missing
 static int ReadIniInteger(CIniReader& ini, const char* section, const char* key, int defaultValue)
@@ -830,6 +1443,12 @@ void Init()
     std::string szLanguage = iniReader.ReadString("MISC", "Language", "");
     if (szLanguage == "0")
         szLanguage.clear();
+    // Icon themes; the former ImproveGamepadSupport = 2 / 3 are PlayStation icons / the original ones
+    std::string szGamepadTheme = iniReader.ReadString("MISC", "GamepadTheme", "");
+    if (szGamepadTheme.empty() || szGamepadTheme == "0")
+        szGamepadTheme = (nImproveGamepadSupport == 2) ? "playstation" : (nImproveGamepadSupport == 3) ? "original" : "xbox";
+    std::string szKeyboardTheme = iniReader.ReadString("MISC", "KeyboardTheme", "original");
+    static bool bPlayStationNames = (IconThemes::Lower(szGamepadTheme) == "playstation");
     MSAA::Install(ReadIniInteger(iniReader, "GRAPHICS", "MSAA", 0));
 
     if (!Screen.nWidth || !Screen.nHeight)
@@ -1223,6 +1842,8 @@ void Init()
     {
         auto table = reinterpret_cast<const uint32_t*>(*language.get_first<uintptr_t>(3) - 4); // name, language, region
         auto pLanguage = *language.get_first<uint32_t*>(9);
+        IconThemes::pLanguage = pLanguage;
+        IconThemes::pLanguageTable = table;
         auto Find = [table](const char* name) -> const uint32_t*
         {
             for (auto entry = table; entry[0]; entry += 3)
@@ -1242,6 +1863,8 @@ void Init()
             injector::MakeNOP(language.get_first(15), 6, true);
         }
     }
+
+    IconThemes::Install(szGamepadTheme, nImproveGamepadSupport != 0, szKeyboardTheme);
 
     if (bSkipIntro)
     {
@@ -1335,33 +1958,6 @@ void Init()
 
     if (nImproveGamepadSupport)
     {
-        pattern = hook::pattern("6A FF 68 ? ? ? ? 64 A1 00 00 00 00 50 64 89 25 00 00 00 00 51 A1 ? ? ? ? 57");
-        CreateResourceFile = (void*(*)(const char* ResourceFileName, int32_t ResourceFileType, int, int, int)) pattern.get_first(0); //0x004482F0
-        pattern = hook::pattern("56 8B F2 89 8E 98 00 00 00 8B 0D ? ? ? ? 89 86 94 00 00 00 8B 86 9C 00 00 00");
-        ResourceFileBeginLoading = (void(__fastcall *)(int a1, void* rsc, int a2)) pattern.get_first(0); //0x00448110;
-
-        if (nImproveGamepadSupport < 3)
-        {
-            static auto TPKPath = GetThisModulePath<std::string>().substr(GetExeModulePath<std::string>().length());
-
-            if (nImproveGamepadSupport == 1)
-                TPKPath += "buttons-xbox.tpk";
-            else if (nImproveGamepadSupport == 2)
-                TPKPath += "buttons-playstation.tpk";
-
-            static injector::hook_back<void(__cdecl*)()> hb_448600;
-            auto LoadTPK = []()
-            {
-                if (std::filesystem::exists(TPKPath))
-                {
-                    LoadResourceFile(TPKPath.c_str(), 1);
-                }
-                return hb_448600.fun();
-            };
-
-            pattern = hook::pattern("E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? 68 ? ? ? ? E8 ? ? ? ? 6A 00 6A 00 6A 00 68 F0 59 00 00"); //0x447280
-            hb_448600.fun = injector::MakeCALL(pattern.get_first(0), static_cast<void(__cdecl*)()>(LoadTPK), true).get();
-        }
 
         struct PadState
         {
@@ -1446,92 +2042,64 @@ void Init()
             }; injector::MakeInline<OrbitHeldHook>(orbit.get_first(0), orbit.get_first(8));
         }
 
-        static bool Zstate, Pstate, Tstate, Dstate, Qstate, Cstate;
+        // Pad buttons as frontend keys (Y = Z, X = P, Select = C, left stick click = T, right one = D, both = Q), sent
+        // when pressed. The callback runs once per device and frame, so the state is kept per device: a second one
+        // (e.g. a joystick) reported nothing pressed and a held button sent its key again every frame. A stick click
+        // alone is sent when it's let go, if the other stick wasn't pressed meanwhile: both sticks are pressed one
+        // after the other, and the first one sent its key before Q.
+        struct PadKeys
+        {
+            bool Y = false, X = false, Select = false, LS = false, RS = false, Q = false;
+            bool both = false; // Both sticks were pressed since they were last let go
+        };
+        static std::map<const void*, PadKeys> DevicePadKeys;
+        static auto SendKey = [](char key)
+        {
+            keybd_event(BYTE(VkKeyScan(key)), 0, KEYEVENTF_EXTENDEDKEY, 0);
+            keybd_event(BYTE(VkKeyScan(key)), 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
+        };
+
         pattern = hook::pattern("7C ? 5F 5D 5E 33 C0 5B C2 08 00"); //0x41989E
         injector::WriteMemory(pattern.count(1).get(0).get<uint32_t>(8 + 5), 0x900008C2, true);
-        //static uintptr_t ButtonsState = (uintptr_t)*hook::pattern("").count(1).get(0).get<uint32_t*>(8); //0x
         struct CatchPad
         {
             void operator()(injector::reg_pack& regs)
             {
                 PadState* PadKeyPresses = *(PadState**)(regs.esp + 0x4);
-                //Keyboard
-                //006F9358 backspace
-                //006F931C enter
                 if (PadKeyPresses != nullptr && PadKeyPresses != (PadState*)0x1 && nGameState == 3)
                 {
-                    if (PadKeyPresses->LSClick && PadKeyPresses->RSClick)
-                    {
-                        if (!Qstate)
-                        {
-                            keybd_event(BYTE(VkKeyScan('Q')), 0, KEYEVENTF_EXTENDEDKEY, 0);
-                            keybd_event(BYTE(VkKeyScan('Q')), 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
-                        }
-                        Qstate = true;
-                    }
-                    else
-                        Qstate = false;
+                    PadKeys& keys = DevicePadKeys[PadKeyPresses];
 
-                    if (PadKeyPresses->Y)
+                    const bool Y = PadKeyPresses->Y != 0, X = PadKeyPresses->X != 0, Select = PadKeyPresses->Select != 0;
+                    if (Y && !keys.Y)
+                        SendKey('Z');
+                    if (X && !keys.X)
+                        SendKey('P');
+                    if (Select && !keys.Select)
                     {
-                        if (!Zstate)
-                        {
-                            keybd_event(BYTE(VkKeyScan('Z')), 0, KEYEVENTF_EXTENDEDKEY, 0);
-                            keybd_event(BYTE(VkKeyScan('Z')), 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
-                        }
-                        Zstate = true;
+                        SendKey('C');
+                        VinylColor::Send(); // The C above may come too short to be seen by VinylColor::PollKeyboard
                     }
-                    else
-                        Zstate = false;
+                    keys.Y = Y;
+                    keys.X = X;
+                    keys.Select = Select;
 
-                    if (PadKeyPresses->X)
+                    const bool LS = PadKeyPresses->LSClick != 0, RS = PadKeyPresses->RSClick != 0;
+                    if (LS && RS)
                     {
-                        if (!Pstate)
-                        {
-                            keybd_event(BYTE(VkKeyScan('P')), 0, KEYEVENTF_EXTENDEDKEY, 0);
-                            keybd_event(BYTE(VkKeyScan('P')), 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
-                        }
-                        Pstate = true;
+                        if (!keys.Q)
+                            SendKey('Q');
+                        keys.both = true;
                     }
-                    else
-                        Pstate = false;
-
-                    if (PadKeyPresses->LSClick && !PadKeyPresses->RSClick)
-                    {
-                        if (!Tstate)
-                        {
-                            keybd_event(BYTE(VkKeyScan('T')), 0, KEYEVENTF_EXTENDEDKEY, 0);
-                            keybd_event(BYTE(VkKeyScan('T')), 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
-                        }
-                        Tstate = true;
-                    }
-                    else
-                        Tstate = false;
-
-                    if (PadKeyPresses->RSClick && !PadKeyPresses->LSClick)
-                    {
-                        if (!Dstate)
-                        {
-                            keybd_event(BYTE(VkKeyScan('D')), 0, KEYEVENTF_EXTENDEDKEY, 0);
-                            keybd_event(BYTE(VkKeyScan('D')), 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
-                        }
-                        Dstate = true;
-                    }
-                    else
-                        Dstate = false;
-
-                    if (PadKeyPresses->Select)
-                    {
-                        if (!Cstate)
-                        {
-                            keybd_event(BYTE(VkKeyScan('C')), 0, KEYEVENTF_EXTENDEDKEY, 0);
-                            keybd_event(BYTE(VkKeyScan('C')), 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
-                            VinylColor::Send(); // The C above may come too short to be seen by VinylColor::PollKeyboard
-                        }
-                        Cstate = true;
-                    }
-                    else
-                        Cstate = false;
+                    keys.Q = LS && RS;
+                    if (!LS && keys.LS && !keys.both)
+                        SendKey('T');
+                    if (!RS && keys.RS && !keys.both)
+                        SendKey('D');
+                    if (!LS && !RS)
+                        keys.both = false;
+                    keys.LS = LS;
+                    keys.RS = RS;
 
                     // For OrbitStick: the furthest pushed of all devices this frame
                     if (std::abs(PadKeyPresses->RSAxis1) + std::abs(PadKeyPresses->RSAxis2) > std::abs(nGameStickX) + std::abs(nGameStickY))
@@ -1540,17 +2108,21 @@ void Init()
                         nGameStickY = PadKeyPresses->RSAxis2;
                     }
                 }
-                else if (nGameState != 3 && bOrbitStick)
+                else if (nGameState != 3)
                 {
-                    pOrbitDelta[0] = pOrbitDelta[1] = 0;
-                    bOrbitStick = false;
+                    DevicePadKeys.clear();
+                    if (bOrbitStick)
+                    {
+                        pOrbitDelta[0] = pOrbitDelta[1] = 0;
+                        bOrbitStick = false;
+                    }
                 }
             }
         }; injector::MakeInline<CatchPad>(pattern.get_first(8));
 
         const wchar_t* ControlsTexts[] = { L" 0", L" 1", L" 2", L" 3", L" 4", L" 5", L" 6", L" 7", L" 8", L" 9", L" Up", L" Down", L" Left", L" Right", L"X Rotation", L"Y Rotation", L"X Axis", L"Y Axis", L"Z Axis", L"Hat Switch" };
-        const wchar_t* ControlsTextsXBOX[] = { L"A", L"B", L"X", L"Y", L"LB", L"RB", L"View (Select)", L"Menu (Start)", L"Left stick", L"Right stick", L"D-pad Up", L"D-pad Down", L"D-pad Left", L"D-pad Right", L"Right stick Left/Right", L"Right stick Up/Down", L"Left stick Left/Right", L"Left stick Up/Down", L"LT / RT", L"D-pad" };
-        const wchar_t* ControlsTextsPS[] = { L"Cross", L"Circle", L"Square", L"Triangle", L"L1", L"R1", L"Select", L"Start", L"L3", L"R3", L"D-pad Up", L"D-pad Down", L"D-pad Left", L"D-pad Right", L"Right stick Left/Right", L"Right stick Up/Down", L"Left stick Left/Right", L"Left stick Up/Down", L"L2 / R2", L"D-pad" };
+        const wchar_t* ControlsTextsXBOX[] = { L"A", L"B", L"X", L"Y", L"LB", L"RB", L"Back (View)", L"Start (Menu)", L"Left stick", L"Right stick", L"D-pad Up", L"D-pad Down", L"D-pad Left", L"D-pad Right", L"Right stick Left/Right", L"Right stick Up/Down", L"Left stick Left/Right", L"Left stick Up/Down", L"LT / RT", L"D-pad", L"Share" };
+        const wchar_t* ControlsTextsPS[] = { L"Cross", L"Circle", L"Square", L"Triangle", L"L1", L"R1", L"Select (Share)", L"Start (Options)", L"L3", L"R3", L"D-pad Up", L"D-pad Down", L"D-pad Left", L"D-pad Right", L"Right stick Left/Right", L"Right stick Up/Down", L"Left stick Left/Right", L"Left stick Up/Down", L"L2 / R2", L"D-pad", L"" };
 
         static std::vector<std::wstring> Texts(ControlsTexts, std::end(ControlsTexts));
         static std::vector<std::wstring> TextsXBOX(ControlsTextsXBOX, std::end(ControlsTextsXBOX));
@@ -1588,7 +2160,10 @@ void Init()
         {
             if (pDeviceIndex && *(int32_t*)(DeviceBase + 0x270 * pDeviceTable[3 * *pDeviceIndex] + 0x134) == 0x13)
                 return L"";
-            const auto& names = (nImproveGamepadSupport != 2) ? TextsXBOX : TextsPS;
+            // From the gamepad theme, read when first needed (the game's language is known by then)
+            static std::vector<std::wstring> names;
+            if (names.empty())
+                names = IconThemes::Names(bPlayStationNames ? TextsPS : TextsXBOX);
 
             // The text shown is (the start of) the name the game just got for this object
             if (pObjectInfo && !text.empty())
@@ -1607,7 +2182,7 @@ void Init()
                         if (instance <= 9)
                             return names[instance];
                         if (instance == 11)
-                            return L"Share";
+                            return names[20];
                         return L"";
                     }
                     if (type & 0x10) // DIDFT_POV
@@ -1635,7 +2210,7 @@ void Init()
                 if (number >= 0 && number <= 9)
                     return names[number];
                 if (number == 11)
-                    return L"Share";
+                    return names[20];
                 return L"";
             }
             for (size_t i = 10; i < Texts.size(); i++)
@@ -1654,10 +2229,12 @@ void Init()
                 regs.eax = regs.ebx + 0x60;
                 regs.esi = regs.esp + 0x10;
 
+                // The game's buffer holds 23 characters (NA 0x4148C4: MultiByteToWideChar with 0x17), 22 and the end:
+                // longer names (a theme's) are cut, they would overwrite the stack
                 auto pszStr = (wchar_t*)(regs.esp + 0x10);
                 std::wstring name = GamepadName(pszStr);
                 if (!name.empty())
-                    wcscpy(pszStr, name.c_str());
+                    wcsncpy_s(pszStr, 23, name.c_str(), _TRUNCATE);
             }
         }; if (pattern.size() > 0) { injector::MakeInline<Buttons>(pattern.get_first(0), pattern.get_first(7)); }
         else

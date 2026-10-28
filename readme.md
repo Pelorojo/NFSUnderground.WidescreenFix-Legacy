@@ -24,6 +24,35 @@ existing settings keep working.
 
 ## Changes
 
+### v1.5
+
+- **Button themes** replace the two 6.4 MB `buttons-*.tpk` packs: `GamepadTheme` and `KeyboardTheme` (`[MISC]`)
+  name a theme in `scripts\buttons\gamepad\` or `scripts\buttons\keyboard\`, a folder or a `.zip` (a folder of
+  the same name wins). Shipped as zips, icons from Kenney's Input Prompts (CC0): `xbox` and `playstation` (new
+  icons, the former ones are gone), and as examples to build on, also usable as they are, `steamdeck` and the
+  keyboard theme `kenney`. `GamepadTheme = 0` (default) goes by `ImproveGamepadSupport`: 1 = `xbox`,
+  2 = `playstation`, 3 = the original icons, so existing settings keep their icons. `KeyboardTheme = 0` (default)
+  keeps the game's key icons. The former `buttons-xbox.tpk` and `buttons-playstation.tpk` are no longer used and can
+  be deleted.
+- A theme is a `theme.ini` plus PNG icons (square, white shapes, the game tints them; 64x64, or 128x128 with a
+  `Zoom` above 1, icons are only scaled down):
+  - `[Theme]`: `Zoom` scales all its icons (e.g. `1.15` = 15 % bigger, cutting the margin around them; below 1
+    smaller).
+  - `[Icons]`: a pad button position (`A`, `B`, `X`, `Y`, `View`, `LS`, `RS`, `Quit`) or a key (`Enter`,
+    `Backspace`, `P`, `Z`, `C`, `T`, `D`, `Q`, `A`, `H`, `R`) = PNG file. Without `Quit` the LS and RS icons are
+    shown side by side. Missing icons stay the game's.
+  - `[Names]`: the button names in the controls setup (22 characters at most, longer ones are cut);
+    `[Names.<code>]` (fr, de, it, es, nl, sv, ru, ko, zh, ja) the ones for a game language, also when it was
+    picked in the language menu. Missing names are the Xbox ones (the PlayStation ones for `playstation`).
+- `ImproveGamepadSupport`: every value above 0 switches it on.
+  - Button names: Xbox `Back (View)` / `Start (Menu)`, PlayStation `Select (Share)` / `Start (Options)`; button 11
+    is `Share` on Xbox, on PlayStation the name Windows gives it.
+  - With a second device plugged in (e.g. a joystick), a held pad button no longer sends its key again every frame.
+  - A single stick click (T / D) is sent when it's let go, so pressing both sticks one after the other only quits
+    (Q) and no longer opens the tutorial or delete first.
+- For other plugins: `ButtonTexture` (export) tells which texture a theme shows instead of one of the game's key
+  icons; the LapRecorder uses it for the icon at the vinyl color (from its next version on).
+
 ### v1.4
 
 - New `MSAA` option (`[GRAPHICS]`, off by default): multisample antialiasing, the highest level up to the set one
@@ -114,5 +143,9 @@ after each build.
 
 - Original work: [ThirteenAG](https://github.com/ThirteenAG) and the contributors of the WidescreenFixesPack.
 - Libraries (git submodules): Hooking.Patterns, injector, IniReader, spdlog, filewatch, ModUtils, minidx9 – each under its own license.
+- Libraries (included in `external`): [stb_image](https://github.com/nothings/stb) (public domain) and
+  [miniz](https://github.com/richgel999/miniz) (MIT) – for the button themes.
+- Button icons of the shipped themes: [Input Prompts](https://kenney.nl/assets/input-prompts) by
+  [Kenney](https://www.kenney.nl) (CC0, license in `textures/kenney-input-prompts`).
 
 MIT License, see [license](license). The original copyright notice is kept unchanged.
