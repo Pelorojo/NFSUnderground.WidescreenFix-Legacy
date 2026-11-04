@@ -413,6 +413,33 @@ namespace FEClip
     }
 }
 
+// The vtable all IDirectInputDevice8A share (keyboard, mouse, joysticks), got from a keyboard device of our own
+void** DInputDeviceVTable()
+{
+    static void** vtable = nullptr;
+    static bool tried = false;
+    if (tried)
+        return vtable;
+    tried = true;
+    HMODULE dinput8 = LoadLibraryA("dinput8.dll");
+    auto pDirectInput8Create = dinput8 ? (decltype(&DirectInput8Create))GetProcAddress(dinput8, "DirectInput8Create") : nullptr;
+    if (!pDirectInput8Create)
+        return nullptr;
+    static const GUID IID_DirectInput8A = { 0xBF798030, 0x483A, 0x4DA2, { 0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00 } };
+    static const GUID GUID_Keyboard = { 0x6F1D2B61, 0xD5A0, 0x11CF, { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+    IDirectInput8A* pDI = nullptr;
+    if (FAILED(pDirectInput8Create(GetModuleHandleA(NULL), DIRECTINPUT_VERSION, IID_DirectInput8A, (void**)&pDI, NULL)) || !pDI)
+        return nullptr;
+    IDirectInputDevice8A* pKeyboard = nullptr;
+    if (SUCCEEDED(pDI->CreateDevice(GUID_Keyboard, &pKeyboard, NULL)) && pKeyboard)
+    {
+        vtable = *(void***)pKeyboard;
+        pKeyboard->Release();
+    }
+    pDI->Release();
+    return vtable;
+}
+
 // The game keeps its keyboard bindings with DirectInput's action mapping (BuildActionMap/SetActionMap on the keyboard
 // only, NA/EU/RU 0x405C60/0x407760), which saves them through dimap.dll. Windows doesn't ship dimap.dll anymore, and
 // with it the game freezes on some PCs, so without it the keyboard was back to the defaults on every start. These two
@@ -510,30 +537,534 @@ namespace KeyboardBindings
         return pSetActionMap(pDevice, lpdiaf, lpszUserName, dwFlags);
     }
 
-    // A keyboard device of our own, only to get to the vtable all devices share
     void Install(const std::string& folder)
     {
         Folder = folder;
-        HMODULE dinput8 = LoadLibraryA("dinput8.dll");
-        auto pDirectInput8Create = dinput8 ? (decltype(&DirectInput8Create))GetProcAddress(dinput8, "DirectInput8Create") : nullptr;
-        if (!pDirectInput8Create)
+        void** vtable = DInputDeviceVTable();
+        if (!vtable)
             return;
-        static const GUID IID_DirectInput8A = { 0xBF798030, 0x483A, 0x4DA2, { 0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00 } };
-        static const GUID GUID_Keyboard = { 0x6F1D2B61, 0xD5A0, 0x11CF, { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
-        IDirectInput8A* pDI = nullptr;
-        if (FAILED(pDirectInput8Create(GetModuleHandleA(NULL), DIRECTINPUT_VERSION, IID_DirectInput8A, (void**)&pDI, NULL)) || !pDI)
-            return;
-        IDirectInputDevice8A* pKeyboard = nullptr;
-        if (SUCCEEDED(pDI->CreateDevice(GUID_Keyboard, &pKeyboard, NULL)) && pKeyboard)
+        pBuildActionMap = (ActionMapFn)vtable[29]; // 0x74
+        pSetActionMap = (ActionMapFn)vtable[30];   // 0x78
+        injector::WriteMemory(&vtable[29], (void*)BuildActionMapHook, true);
+        injector::WriteMemory(&vtable[30], (void*)SetActionMapHook, true);
+    }
+}
+
+// Gamepad vibration ([MISC] Vibration) from the game's force feedback. The game plays it with DirectInput effects (its
+// "EZ Wheel Wrapper", NA 0x418D70-0x41C240), only on a device whose axes EnumObjects reports as force feedback
+// actuators (the callback, NA 0x419180, counts them as the channel's effect axes; none = no effects at all). XInput
+// pads have none in DirectInput, and Wine offers no DirectInput effects at all. So on the DirectInput side of an
+// XInput gamepad without force feedback of its own the X and Y axes are reported as actuators, CreateEffect hands out
+// effect objects of our own, and the force feedback command and gain are answered here (a failing SETACTUATORSON
+// would make the game skip reading the device). What the effects play is worked out on every GetDeviceState and set
+// on the XInput motors by a background thread (the XInput calls can take milliseconds, under Wine more, so the game
+// thread doesn't wait for them): periodic effects with a duration (the jolts from hits and sudden speed changes, square 150 ms) to
+// the low frequency motor, endless ones (the rumble of the surface) to the high frequency one. Constant forces and
+// conditions (steering force, centering, damper) have no match on a pad and are left out. The game doesn't stop the
+// surface rumble in the pause menu, but asks its effects about their status every race frame, so endless effects are
+// silent while nothing was asked for 300 ms. The pads go to the XInput slots in the order they were opened.
+namespace Vibration
+{
+    int Strength = 100;   // Percent, 100 = twice the effects' magnitude
+
+    using XInputGetCapabilities_t = DWORD(WINAPI*)(DWORD, DWORD, XINPUT_CAPABILITIES*);
+    using XInputSetState_t = DWORD(WINAPI*)(DWORD, XINPUT_VIBRATION*);
+    XInputGetCapabilities_t pXGetCapabilities = nullptr;
+    XInputSetState_t pXSetState = nullptr;
+
+    struct Effect;
+    struct Device
+    {
+        void* device;
+        DWORD gain = 10000;   // DIPROP_FFGAIN
+        DWORD lastAsked = 0;  // Last call of the game on one of its effects
+        DWORD lastRead = 0;   // Last GetDeviceState
+        WORD low = 0, high = 0; // Motor speeds the effects play, for the background thread
+        std::vector<Effect*> effects;
+    };
+    std::vector<Device> Devices;
+    CRITICAL_SECTION Lock;    // Devices and the effects: game thread + background thread (no XInput calls while held)
+
+    // Background thread only: slot of the index-th plugged in XInput gamepad; the slots are looked up again at most
+    // every 2 s (asking empty slots is slow)
+    int Slot(size_t index)
+    {
+        static bool gamepad[XUSER_MAX_COUNT] = {};
+        static DWORD nextSearch = 0;
+        const DWORD now = GetTickCount();
+        if (now >= nextSearch)
         {
-            void** vtable = *(void***)pKeyboard;
-            pBuildActionMap = (ActionMapFn)vtable[29]; // 0x74
-            pSetActionMap = (ActionMapFn)vtable[30];   // 0x78
-            injector::WriteMemory(&vtable[29], (void*)BuildActionMapHook, true);
-            injector::WriteMemory(&vtable[30], (void*)SetActionMapHook, true);
-            pKeyboard->Release();
+            nextSearch = now + 2000;
+            for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i)
+            {
+                XINPUT_CAPABILITIES caps = {};
+                gamepad[i] = pXGetCapabilities(i, XINPUT_FLAG_GAMEPAD, &caps) == ERROR_SUCCESS;
+            }
         }
-        pDI->Release();
+        for (int i = 0; i < XUSER_MAX_COUNT; ++i)
+        {
+            if (gamepad[i] && index-- == 0)
+                return i;
+        }
+        return -1;
+    }
+
+    Device* Find(void* device)
+    {
+        for (auto& d : Devices)
+        {
+            if (d.device == device)
+                return &d;
+        }
+        return nullptr;
+    }
+
+    struct Effect : IDirectInputEffect
+    {
+        LONG refs = 1;
+        GUID guid;
+        void* device;
+        bool periodic = false;       // Square, sine, triangle, sawtooth up / down
+        DWORD duration = INFINITE;   // Microseconds
+        DWORD gain = 10000;
+        DWORD magnitude = 0;
+        DWORD period = 0;
+        bool playing = false;
+        DWORD started = 0;
+
+        Effect(void* dev, REFGUID g) : guid(g), device(dev)
+        {
+            // The DirectInput effect GUIDs differ only in Data1: 0x13541C22-0x13541C26 are the periodic ones
+            static const GUID square = { 0x13541C22, 0x8E33, 0x11D0, { 0x9A, 0xD0, 0x00, 0xA0, 0xC9, 0xA0, 0x6E, 0x35 } };
+            periodic = g.Data1 >= 0x13541C22 && g.Data1 <= 0x13541C26 && memcmp(&g.Data2, &square.Data2, sizeof(GUID) - sizeof(DWORD)) == 0;
+        }
+
+        void Asked() // Lock held
+        {
+            if (Device* d = Find(device))
+                d->lastAsked = GetTickCount();
+        }
+
+        bool Playing(DWORD now) const
+        {
+            return playing && (duration == INFINITE || now - started < duration / 1000);
+        }
+
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* ppv) override
+        {
+            static const GUID IID_Effect = { 0xE7E1F7C0, 0x88D2, 0x11D0, { 0x9A, 0xD0, 0x00, 0xA0, 0xC9, 0xA0, 0x6E, 0x35 } };
+            static const GUID IID_Unknown = { 0x00000000, 0x0000, 0x0000, { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+            if (!ppv)
+                return E_POINTER;
+            if (riid != IID_Effect && riid != IID_Unknown)
+            {
+                *ppv = nullptr;
+                return E_NOINTERFACE;
+            }
+            *ppv = this;
+            AddRef();
+            return S_OK;
+        }
+        ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
+        ULONG STDMETHODCALLTYPE Release() override
+        {
+            ULONG left = InterlockedDecrement(&refs);
+            if (left == 0)
+            {
+                EnterCriticalSection(&Lock);
+                if (Device* d = Find(device))
+                    d->effects.erase(std::remove(d->effects.begin(), d->effects.end(), this), d->effects.end());
+                LeaveCriticalSection(&Lock);
+                delete this;
+            }
+            return left;
+        }
+        HRESULT STDMETHODCALLTYPE Initialize(HINSTANCE, DWORD, REFGUID) override { return DI_OK; }
+        HRESULT STDMETHODCALLTYPE GetEffectGuid(LPGUID pguid) override
+        {
+            if (!pguid)
+                return E_POINTER;
+            *pguid = guid;
+            return DI_OK;
+        }
+        HRESULT STDMETHODCALLTYPE GetParameters(LPDIEFFECT peff, DWORD flags) override
+        {
+            if (!peff)
+                return E_POINTER;
+            if (flags & DIEP_DURATION)
+                peff->dwDuration = duration;
+            if (flags & DIEP_GAIN)
+                peff->dwGain = gain;
+            return DI_OK;
+        }
+        HRESULT STDMETHODCALLTYPE SetParameters(LPCDIEFFECT peff, DWORD flags) override
+        {
+            if (!peff)
+                return E_POINTER;
+            EnterCriticalSection(&Lock);
+            if (flags & DIEP_DURATION)
+                duration = peff->dwDuration;
+            if (flags & DIEP_GAIN)
+                gain = (std::min)(peff->dwGain, (DWORD)10000);
+            if ((flags & DIEP_TYPESPECIFICPARAMS) && periodic && peff->lpvTypeSpecificParams && peff->cbTypeSpecificParams >= sizeof(DIPERIODIC))
+            {
+                auto p = static_cast<const DIPERIODIC*>(peff->lpvTypeSpecificParams);
+                magnitude = (std::min)(p->dwMagnitude, (DWORD)10000);
+                period = p->dwPeriod;
+            }
+            Asked();
+            LeaveCriticalSection(&Lock);
+            if (flags & DIEP_START)
+                return Start(1, 0);
+            return DI_OK;
+        }
+        HRESULT STDMETHODCALLTYPE Start(DWORD, DWORD) override
+        {
+            EnterCriticalSection(&Lock);
+            playing = true;
+            started = GetTickCount();
+            Asked();
+            LeaveCriticalSection(&Lock);
+            return DI_OK;
+        }
+        HRESULT STDMETHODCALLTYPE Stop() override
+        {
+            EnterCriticalSection(&Lock);
+            playing = false;
+            Asked();
+            LeaveCriticalSection(&Lock);
+            return DI_OK;
+        }
+        HRESULT STDMETHODCALLTYPE GetEffectStatus(LPDWORD status) override
+        {
+            if (!status)
+                return E_POINTER;
+            EnterCriticalSection(&Lock);
+            *status = Playing(GetTickCount()) ? DIEGES_PLAYING : 0;
+            Asked();
+            LeaveCriticalSection(&Lock);
+            return DI_OK;
+        }
+        HRESULT STDMETHODCALLTYPE Download() override { return DI_OK; }
+        HRESULT STDMETHODCALLTYPE Unload() override { return Stop(); }
+        HRESULT STDMETHODCALLTYPE Escape(LPDIEFFESCAPE) override { return DIERR_UNSUPPORTED; }
+    };
+
+    // Lock held
+    void Compute(Device& d, bool silent)
+    {
+        DWORD low = 0, high = 0;
+        if (!silent)
+        {
+            const DWORD now = GetTickCount();
+            const bool asked = now - d.lastAsked < 300;
+            for (Effect* e : d.effects)
+            {
+                if (!e->periodic || !e->Playing(now))
+                    continue;
+                const DWORD level = e->magnitude * e->gain / 10000;
+                if (e->duration != INFINITE)
+                    low = (std::max)(low, level);
+                else if (asked)
+                    high = (std::max)(high, level);
+            }
+        }
+        // Strength 100 = twice the effect's magnitude (tested: the plain magnitude is too weak on a pad; the surface
+        // rumble is then already at full speed, so more makes no difference), cut at full speed. The jolts go by the
+        // square root of their magnitude: most are below 16 % (landings, bumps; walls only from a sudden drop in speed),
+        // and a 150 ms jolt that weak hardly gets the big motor going, while a DirectInput pad with force feedback
+        // (original Xbox Controller S) makes them clearly felt. So 1 % gives 20 %, 4 % 40 %, 16 % 80 %, 25 % and more
+        // full speed.
+        const auto speed = [&](double share) { return (WORD)((std::min)(1.0, share * Strength * 2 / 100) * 65535); };
+        const double gainShare = d.gain / 10000.0;
+        d.low = speed(std::sqrt(low / 10000.0 * gainShare));
+        d.high = speed(high / 10000.0 * gainShare);
+        d.lastRead = GetTickCount();
+    }
+
+    void Update(void* device, bool silent)
+    {
+        EnterCriticalSection(&Lock);
+        for (size_t i = 0; i < Devices.size(); ++i)
+        {
+            if (Devices[i].device == device)
+                Compute(Devices[i], silent);
+        }
+        LeaveCriticalSection(&Lock);
+    }
+
+    // Background thread: every 10 ms each slot's motors set to what its pad's effects play, only when that changes.
+    // A pad the game no longer reads for 300 ms (loading, window in the background) or that is gone gets nothing.
+    // Under Wine every motor speed set runs out after at most 1 s (winebus' haptics cutoff time), and Wine's
+    // XInputSetState passes on only speeds that differ from the last ones, so a running motor gets its speed again every
+    // 500 ms, with the lowest bit flipped every other time.
+    DWORD WINAPI Worker(LPVOID)
+    {
+        constexpr size_t MAX_PADS = 8;
+        const bool wine = GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version") != nullptr;
+        WORD sentLow[XUSER_MAX_COUNT] = {}, sentHigh[XUSER_MAX_COUNT] = {};
+        DWORD sentAt[XUSER_MAX_COUNT] = {};
+        bool flipped[XUSER_MAX_COUNT] = {};
+        for (;;)
+        {
+            Sleep(10);
+            WORD low[MAX_PADS] = {}, high[MAX_PADS] = {};
+            EnterCriticalSection(&Lock);
+            const DWORD now = GetTickCount();
+            const size_t count = (std::min)(Devices.size(), MAX_PADS);
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (now - Devices[i].lastRead < 300)
+                {
+                    low[i] = Devices[i].low;
+                    high[i] = Devices[i].high;
+                }
+            }
+            LeaveCriticalSection(&Lock);
+
+            WORD wantedLow[XUSER_MAX_COUNT] = {}, wantedHigh[XUSER_MAX_COUNT] = {};
+            for (size_t i = 0; i < count; ++i)
+            {
+                const int slot = Slot(i);
+                if (slot >= 0)
+                {
+                    wantedLow[slot] = low[i];
+                    wantedHigh[slot] = high[i];
+                }
+            }
+            const DWORD sendTime = GetTickCount();
+            for (DWORD slot = 0; slot < XUSER_MAX_COUNT; ++slot)
+            {
+                XINPUT_VIBRATION vibration = { wantedLow[slot], wantedHigh[slot] };
+                if (wantedLow[slot] == sentLow[slot] && wantedHigh[slot] == sentHigh[slot])
+                {
+                    if (!wine || (!wantedLow[slot] && !wantedHigh[slot]) || sendTime - sentAt[slot] < 500)
+                        continue;
+                    flipped[slot] = !flipped[slot];
+                    WORD& motor = wantedLow[slot] ? vibration.wLeftMotorSpeed : vibration.wRightMotorSpeed;
+                    if (flipped[slot])
+                        motor = (motor ^ 1) ? (motor ^ 1) : 3;
+                }
+                else
+                    flipped[slot] = false;
+                pXSetState(slot, &vibration);
+                sentLow[slot] = wantedLow[slot];
+                sentHigh[slot] = wantedHigh[slot];
+                sentAt[slot] = sendTime;
+            }
+        }
+    }
+
+    typedef ULONG(__stdcall* ReleaseFn)(void*);
+    typedef HRESULT(__stdcall* GetCapabilitiesFn)(void*, LPDIDEVCAPS);
+    typedef HRESULT(__stdcall* EnumObjectsFn)(void*, LPDIENUMDEVICEOBJECTSCALLBACKA, LPVOID, DWORD);
+    typedef HRESULT(__stdcall* PropertyFn)(void*, REFGUID, LPDIPROPHEADER);
+    typedef HRESULT(__stdcall* UnacquireFn)(void*);
+    typedef HRESULT(__stdcall* GetDeviceStateFn)(void*, DWORD, LPVOID);
+    typedef HRESULT(__stdcall* CreateEffectFn)(void*, REFGUID, LPCDIEFFECT, LPDIRECTINPUTEFFECT*, LPUNKNOWN);
+    typedef HRESULT(__stdcall* CommandFn)(void*, DWORD);
+    ReleaseFn pRelease;
+    GetCapabilitiesFn pGetCapabilities;
+    EnumObjectsFn pEnumObjects;
+    PropertyFn pGetProperty, pSetProperty;
+    UnacquireFn pUnacquire;
+    GetDeviceStateFn pGetDeviceState;
+    CreateEffectFn pCreateEffect;
+    CommandFn pSendForceFeedbackCommand;
+
+    bool IsFake(void* device)
+    {
+        EnterCriticalSection(&Lock);
+        bool fake = Find(device) != nullptr;
+        LeaveCriticalSection(&Lock);
+        return fake;
+    }
+
+    ULONG __stdcall ReleaseHook(void* device)
+    {
+        ULONG left = pRelease(device);
+        if (left == 0)
+        {
+            EnterCriticalSection(&Lock);
+            for (size_t i = 0; i < Devices.size(); ++i)
+            {
+                if (Devices[i].device == device)
+                {
+                    for (Effect* e : Devices[i].effects)
+                        e->device = nullptr; // The game may still hold them
+                    Devices.erase(Devices.begin() + i);
+                    break;
+                }
+            }
+            LeaveCriticalSection(&Lock);
+        }
+        return left;
+    }
+
+    struct EnumContext
+    {
+        LPDIENUMDEVICEOBJECTSCALLBACKA callback;
+        LPVOID ref;
+    };
+
+    BOOL CALLBACK EnumObjectsCallback(LPCDIDEVICEOBJECTINSTANCEA object, LPVOID ref)
+    {
+        auto context = static_cast<EnumContext*>(ref);
+        static const GUID XAxis = { 0xA36D02E0, 0xC9F3, 0x11CF, { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+        static const GUID YAxis = { 0xA36D02E1, 0xC9F3, 0x11CF, { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+        if (!object || (object->guidType != XAxis && object->guidType != YAxis))
+            return context->callback(object, context->ref);
+        DIDEVICEOBJECTINSTANCEA copy = {};
+        memcpy(&copy, object, (std::min)((size_t)object->dwSize, sizeof(copy)));
+        copy.dwFlags |= DIDOI_FFACTUATOR;
+        copy.dwType |= DIDFT_FFACTUATOR;
+        return context->callback(&copy, context->ref);
+    }
+
+    // The DirectInput side of an XInput pad has "IG_" in its device path (Windows, and Wine's winexinput)
+    bool IsXInputDevice(void* device)
+    {
+        DIPROPGUIDANDPATH path = {};
+        path.diph.dwSize = sizeof(path);
+        path.diph.dwHeaderSize = sizeof(DIPROPHEADER);
+        path.diph.dwHow = DIPH_DEVICE;
+        if (FAILED(pGetProperty(device, DIPROP_GUIDANDPATH, &path.diph)))
+            return false;
+        _wcsupr_s(path.wszPath);
+        return wcsstr(path.wszPath, L"IG_") != nullptr;
+    }
+
+    HRESULT __stdcall EnumObjectsHook(void* device, LPDIENUMDEVICEOBJECTSCALLBACKA callback, LPVOID ref, DWORD flags)
+    {
+        if (!callback)
+            return pEnumObjects(device, callback, ref, flags);
+        if (!IsFake(device))
+        {
+            DIDEVCAPS caps = {};
+            caps.dwSize = sizeof(caps);
+            const BYTE type = SUCCEEDED(pGetCapabilities(device, &caps)) ? LOBYTE(caps.dwDevType) : 0;
+            if (type < DI8DEVTYPE_JOYSTICK || type > DI8DEVTYPE_1STPERSON || (caps.dwFlags & DIDC_FORCEFEEDBACK))
+                return pEnumObjects(device, callback, ref, flags);
+            const bool xinput = IsXInputDevice(device);
+            if (!xinput)
+                return pEnumObjects(device, callback, ref, flags);
+            EnterCriticalSection(&Lock);
+            Devices.push_back(Device{ device });
+            Devices.back().lastAsked = GetTickCount() - 1000;
+            LeaveCriticalSection(&Lock);
+        }
+        EnumContext context = { callback, ref };
+        return pEnumObjects(device, EnumObjectsCallback, &context, flags);
+    }
+
+    HRESULT __stdcall GetPropertyHook(void* device, REFGUID prop, LPDIPROPHEADER header)
+    {
+        if (&prop == &DIPROP_FFGAIN && header && header->dwSize >= sizeof(DIPROPDWORD))
+        {
+            EnterCriticalSection(&Lock);
+            Device* d = Find(device);
+            if (d)
+                reinterpret_cast<LPDIPROPDWORD>(header)->dwData = d->gain;
+            LeaveCriticalSection(&Lock);
+            if (d)
+                return DI_OK;
+        }
+        return pGetProperty(device, prop, header);
+    }
+
+    HRESULT __stdcall SetPropertyHook(void* device, REFGUID prop, LPDIPROPHEADER header)
+    {
+        if ((&prop == &DIPROP_FFGAIN || &prop == &DIPROP_AUTOCENTER) && header && header->dwSize >= sizeof(DIPROPDWORD))
+        {
+            EnterCriticalSection(&Lock);
+            Device* d = Find(device);
+            if (d && &prop == &DIPROP_FFGAIN)
+                d->gain = (std::min)(reinterpret_cast<LPDIPROPDWORD>(header)->dwData, (DWORD)10000);
+            LeaveCriticalSection(&Lock);
+            if (d)
+                return DI_OK;
+        }
+        return pSetProperty(device, prop, header);
+    }
+
+    HRESULT __stdcall UnacquireHook(void* device)
+    {
+        Update(device, true);
+        return pUnacquire(device);
+    }
+
+    HRESULT __stdcall GetDeviceStateHook(void* device, DWORD size, LPVOID data)
+    {
+        HRESULT hr = pGetDeviceState(device, size, data);
+        Update(device, FAILED(hr));
+        return hr;
+    }
+
+    HRESULT __stdcall CreateEffectHook(void* device, REFGUID guid, LPCDIEFFECT params, LPDIRECTINPUTEFFECT* effect, LPUNKNOWN outer)
+    {
+        if (!IsFake(device))
+            return pCreateEffect(device, guid, params, effect, outer);
+        if (!effect)
+            return E_POINTER;
+        auto e = new Effect(device, guid);
+        EnterCriticalSection(&Lock);
+        Find(device)->effects.push_back(e);
+        LeaveCriticalSection(&Lock);
+        if (params)
+            e->SetParameters(params, DIEP_DURATION | DIEP_GAIN | DIEP_TYPESPECIFICPARAMS);
+        *effect = e;
+        return DI_OK;
+    }
+
+    HRESULT __stdcall SendForceFeedbackCommandHook(void* device, DWORD command)
+    {
+        if (!IsFake(device))
+            return pSendForceFeedbackCommand(device, command);
+        if (command & (DISFFC_RESET | DISFFC_STOPALL))
+        {
+            EnterCriticalSection(&Lock);
+            if (Device* d = Find(device))
+            {
+                for (Effect* e : d->effects)
+                    e->playing = false;
+            }
+            LeaveCriticalSection(&Lock);
+            Update(device, true);
+        }
+        return DI_OK;
+    }
+
+    void Install(int strength)
+    {
+        void** vtable = DInputDeviceVTable();
+        HMODULE xinput = LoadLibraryA("XInput9_1_0.dll");
+        if (!vtable || !xinput)
+            return;
+        pXGetCapabilities = reinterpret_cast<XInputGetCapabilities_t>(GetProcAddress(xinput, "XInputGetCapabilities"));
+        pXSetState = reinterpret_cast<XInputSetState_t>(GetProcAddress(xinput, "XInputSetState"));
+        if (!pXGetCapabilities || !pXSetState)
+            return;
+        Strength = strength;
+        InitializeCriticalSection(&Lock);
+
+        pRelease = (ReleaseFn)vtable[2];
+        pGetCapabilities = (GetCapabilitiesFn)vtable[3];
+        pEnumObjects = (EnumObjectsFn)vtable[4];
+        pGetProperty = (PropertyFn)vtable[5];
+        pSetProperty = (PropertyFn)vtable[6];
+        pUnacquire = (UnacquireFn)vtable[8];
+        pGetDeviceState = (GetDeviceStateFn)vtable[9];
+        pCreateEffect = (CreateEffectFn)vtable[18];
+        pSendForceFeedbackCommand = (CommandFn)vtable[22];
+        injector::WriteMemory(&vtable[2], (void*)ReleaseHook, true);
+        injector::WriteMemory(&vtable[4], (void*)EnumObjectsHook, true);
+        injector::WriteMemory(&vtable[5], (void*)GetPropertyHook, true);
+        injector::WriteMemory(&vtable[6], (void*)SetPropertyHook, true);
+        injector::WriteMemory(&vtable[8], (void*)UnacquireHook, true);
+        injector::WriteMemory(&vtable[9], (void*)GetDeviceStateHook, true);
+        injector::WriteMemory(&vtable[18], (void*)CreateEffectHook, true);
+        injector::WriteMemory(&vtable[22], (void*)SendForceFeedbackCommandHook, true);
+        CloseHandle(CreateThread(NULL, 0, Worker, NULL, 0, NULL));
     }
 }
 
@@ -1437,6 +1968,7 @@ void Init()
     }
     bool bBlackMagazineFix = ReadIniInteger(iniReader, "MISC", "BlackMagazineFix", 1) != 0;
     bool bSaveKeyboardBindings = ReadIniInteger(iniReader, "MISC", "SaveKeyboardBindings", 1) != 0;
+    int nVibration = (std::max)(0, ReadIniInteger(iniReader, "MISC", "Vibration", 100)); // Above 100 only the weak jolts get stronger
     if (szCustomUserFilesDirectoryInGameDir.empty() || szCustomUserFilesDirectoryInGameDir == "0")
         szCustomUserFilesDirectoryInGameDir.clear();
     int nWindowedMode = ReadIniInteger(iniReader, "MISC", "WindowedMode", 0);
@@ -1955,6 +2487,9 @@ void Init()
             SHGetFolderPathA(NULL, CSIDL_COMMON_APPDATA | CSIDL_FLAG_CREATE, NULL, 0, folder);
         KeyboardBindings::Install(std::string(folder) + "\\NFS Underground\\");
     }
+
+    if (nVibration)
+        Vibration::Install(nVibration);
 
     if (nImproveGamepadSupport)
     {

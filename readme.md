@@ -24,6 +24,19 @@ existing settings keep working.
 
 ## Changes
 
+### Next version
+
+- New `Vibration` option (`[MISC]`, 100 by default, 0 = off, 1 - 100 = strength in percent): XInput gamepads
+  vibrate with the game's force feedback, also under Wine. The game only plays it on DirectInput devices with force
+  feedback, which XInput pads aren't on the DirectInput side, so for them the fix takes the effects and sets the
+  pad's motors: the jolts from hits and landings on the big motor, the rumble of the surface (gravel, grass, curbs)
+  on the small one. Steering forces have no match on a pad and are left out, as a DirectInput pad with force
+  feedback does too. Weak jolts are raised more than strong ones (by the square root of their strength), so that
+  bumps and landings are felt like on such a pad. Nothing changes for wheels and pads with force feedback of their
+  own.
+- Under Wine the motors run out after one second and the same speed isn't passed on again, so there a running
+  motor gets its speed again every half second.
+
 ### v1.5
 
 - **Button themes** replace the two 6.4 MB `buttons-*.tpk` packs: `GamepadTheme` and `KeyboardTheme` (`[MISC]`)
