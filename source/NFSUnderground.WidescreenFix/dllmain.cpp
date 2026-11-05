@@ -3,6 +3,7 @@
 #include <d3d9.h>
 #include <algorithm>
 #include <unordered_map>
+#include <atomic>
 #include <cmath>
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
@@ -757,6 +758,276 @@ namespace ControllerBindings
         pSave = reinterpret_cast<SaveFn>(injector::GetBranchDestination(save.get_first(6)).as_int());
         injector::MakeCALL(loadProfile.get_first(12), LoadProfileHook, true);
         injector::MakeCALL(save.get_first(6), SaveHook, true);
+    }
+}
+
+// The right stick of an XInput gamepad as two more buttons ([MISC] RightStickButtons, the threshold in percent): the
+// game only lets buttons do the digital actions (e.g. shifting), and reads 16 buttons of a device's state, also when
+// assigning one in the controls setup (NA/EU 0x4067D0). An XInput pad has about 10 on the DirectInput side, so the
+// stick pushed up past the threshold is button 15 (+0x3E in the game's state, buttons from +0x30) and down button 16,
+// let go again below 60 % of it; GetObjectInfo gives their names ("Right stick Up" / "Down"). They can be assigned
+// like any button. The stick's up/down never does two things: a controller object's analog bindings are 4 axes at
+// +0x244 (offsets in the state, lRy = 0x10), each in use while its byte at +0x264 is set (the game clears it when the
+// axis goes to another action, NA 0x406680: actions 1/2 brake/throttle, 3/4 steering; throttle and brake on one
+// axis are the 4th, +0x250, also flagged at +0x268), and its buttons' actions 32 ints at +0x18 (0 = none, 0x406E10). The
+// binding made last wins: the up/down axis given to an analog action takes the two buttons' actions away, one of the
+// buttons given an action takes the axis away; and while both are set (an older .cfg) the buttons stay silent. While
+// the controls setup waits for a button or axis (the action at +0x23C, 1-4 = the analog ones) the buttons are there
+// for a digital action even with the axis bound, and never for an analog one (so it gets the axis). The stick is read by a thread of its own: XInput calls on the game thread can take milliseconds
+// (under Wine more); with more than one pad the one whose right stick is pushed furthest.
+namespace RightStickButtons
+{
+    typedef HRESULT(__stdcall* GetDeviceStateFn)(void*, DWORD, LPVOID);
+    typedef HRESULT(__stdcall* GetObjectInfoFn)(void*, LPDIDEVICEOBJECTINSTANCEA, DWORD, DWORD);
+    typedef HRESULT(__stdcall* GetPropertyFn)(void*, REFGUID, LPDIPROPHEADER);
+    GetDeviceStateFn pGetDeviceState = nullptr;
+    GetObjectInfoFn pGetObjectInfo = nullptr;
+    GetPropertyFn pGetProperty = nullptr;
+    constexpr DWORD UpOffset = 0x30 + 14, DownOffset = 0x30 + 15;
+    int Threshold = 5000;          // The game's axis range [-10000, 10000]
+    int Release = 3000;
+    std::atomic<int> StickY{ 0 };  // Up negative
+    bool Up = false, Down = false;
+    bool Enabled = false;
+    void** DeviceArray = nullptr;    // The game's IDirectInputDevice8A* per channel
+    uint8_t* Controllers = nullptr;  // The game's controller objects (6, 0x270 each, channel at +0x130)
+
+    // The controller objects of a device (they hold its channel at +0x130)
+    template<typename F> void ForControllers(void* device, F f)
+    {
+        if (!DeviceArray || !Controllers)
+            return;
+        for (int channel = 0; channel < 2; ++channel)
+        {
+            if (DeviceArray[channel] != device)
+                continue;
+            for (int i = 0; i < 6; ++i)
+            {
+                if (*(const int*)(Controllers + i * 0x270 + 0x130) == channel)
+                    f(i, Controllers + i * 0x270);
+            }
+        }
+    }
+
+    bool AxisBound(const uint8_t* controller)
+    {
+        for (int a = 0; a < 4; ++a)
+        {
+            if (controller[0x264 + a] && *(const int*)(controller + 0x244 + a * 4) == 0x10) // lRy
+                return true;
+        }
+        return false;
+    }
+
+    bool ButtonsBound(const uint8_t* controller)
+    {
+        return *(const int*)(controller + 0x18 + 14 * 4) || *(const int*)(controller + 0x18 + 15 * 4);
+    }
+
+    // Takes the older of the two bindings away when the other was just made; true while the axis is bound
+    bool Settle(int i, uint8_t* controller)
+    {
+        static bool known[6] = {}, axisBefore[6] = {}, buttonsBefore[6] = {};
+        bool axis = AxisBound(controller), buttons = ButtonsBound(controller);
+        if (known[i] && axis && buttons)
+        {
+            if (!axisBefore[i]) // The axis was just given to an analog action
+            {
+                *(int*)(controller + 0x18 + 14 * 4) = 0;
+                *(int*)(controller + 0x18 + 15 * 4) = 0;
+                buttons = false;
+            }
+            else if (!buttonsBefore[i]) // A button was just given an action
+            {
+                for (int a = 0; a < 4; ++a)
+                {
+                    if (*(const int*)(controller + 0x244 + a * 4) == 0x10)
+                    {
+                        controller[0x264 + a] = 0;
+                        if (a == 3)
+                            controller[0x268] = 0; // Throttle and brake on the same axis (the 4th one, +0x250)
+                    }
+                }
+                axis = false;
+            }
+        }
+        known[i] = true;
+        axisBefore[i] = axis;
+        buttonsBefore[i] = buttons;
+        return axis;
+    }
+
+    // Whether the buttons are reported for the device now
+    bool Reconcile(void* device)
+    {
+        bool axisInUse = false, assigningDigital = false, assigningAnalog = false;
+        ForControllers(device, [&](int i, uint8_t* controller)
+        {
+            const int assigning = *(const int*)(controller + 0x23C);
+            assigningAnalog |= assigning >= 1 && assigning <= 4;
+            assigningDigital |= assigning > 4;
+            axisInUse |= Settle(i, controller);
+        });
+        if (assigningAnalog)
+            return false;
+        return assigningDigital || !axisInUse;
+    }
+
+    // Right after the controls setup took a button or axis (NA/EU 0x4067D0 from 0x4065A1, the controller in edi),
+    // before the screen shows the bindings again, so the binding taken away is gone there too
+    void* pCapture = nullptr;
+
+    void __cdecl AfterCapture(uint8_t* controller)
+    {
+        if (Controllers && controller >= Controllers && controller < Controllers + 6 * 0x270)
+            Settle(static_cast<int>(controller - Controllers) / 0x270, controller);
+    }
+
+    void __declspec(naked) CaptureHook()
+    {
+        __asm
+        {
+            push edi
+            call dword ptr [pCapture]
+            pop edi
+            push edi
+            call AfterCapture
+            add esp, 4
+            ret
+        }
+    }
+
+    DWORD WINAPI Reader(LPVOID)
+    {
+        using XInputGetState_t = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+        using XInputGetCapabilities_t = DWORD(WINAPI*)(DWORD, DWORD, XINPUT_CAPABILITIES*);
+        HMODULE xinput = LoadLibraryA("XInput9_1_0.dll");
+        auto pGetState = xinput ? reinterpret_cast<XInputGetState_t>(GetProcAddress(xinput, "XInputGetState")) : nullptr;
+        auto pGetCapabilities = xinput ? reinterpret_cast<XInputGetCapabilities_t>(GetProcAddress(xinput, "XInputGetCapabilities")) : nullptr;
+        if (!pGetState || !pGetCapabilities)
+            return 0;
+        bool gamepad[XUSER_MAX_COUNT] = {};
+        DWORD nextSearch = 0;
+        for (;;)
+        {
+            Sleep(5);
+            const DWORD now = GetTickCount();
+            if (now >= nextSearch) // Asking unplugged slots is slow: at most every 2 s
+            {
+                nextSearch = now + 2000;
+                for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i)
+                {
+                    XINPUT_CAPABILITIES caps = {};
+                    gamepad[i] = pGetCapabilities(i, XINPUT_FLAG_GAMEPAD, &caps) == ERROR_SUCCESS && caps.SubType == XINPUT_DEVSUBTYPE_GAMEPAD;
+                }
+            }
+            int y = 0, best = -1;
+            for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i)
+            {
+                XINPUT_STATE state = {};
+                if (!gamepad[i])
+                    continue;
+                if (pGetState(i, &state) != ERROR_SUCCESS)
+                {
+                    gamepad[i] = false;
+                    continue;
+                }
+                const int deflection = std::abs(static_cast<int>(state.Gamepad.sThumbRY));
+                if (deflection > best)
+                {
+                    best = deflection;
+                    y = -state.Gamepad.sThumbRY * 10000 / 32767;
+                }
+            }
+            StickY = y;
+        }
+    }
+
+    // The DirectInput side of an XInput pad has "IG_" in its device path; remembered per device
+    bool IsXInputDevice(void* device)
+    {
+        static std::vector<std::pair<void*, bool>> known;
+        for (auto& k : known)
+        {
+            if (k.first == device)
+                return k.second;
+        }
+        DIPROPGUIDANDPATH path = {};
+        path.diph.dwSize = sizeof(path);
+        path.diph.dwHeaderSize = sizeof(DIPROPHEADER);
+        path.diph.dwHow = DIPH_DEVICE;
+        bool xinput = false;
+        if (SUCCEEDED(pGetProperty(device, DIPROP_GUIDANDPATH, &path.diph)))
+        {
+            _wcsupr_s(path.wszPath);
+            xinput = wcsstr(path.wszPath, L"IG_") != nullptr;
+        }
+        known.emplace_back(device, xinput);
+        return xinput;
+    }
+
+    HRESULT __stdcall GetDeviceStateHook(void* device, DWORD size, LPVOID data)
+    {
+        HRESULT hr = pGetDeviceState(device, size, data);
+        if (FAILED(hr) || !data || size <= DownOffset || !IsXInputDevice(device))
+            return hr;
+        const int y = Reconcile(device) ? StickY.load() : 0;
+        Up = Up ? y < -Release : y <= -Threshold;
+        Down = Down ? y > Release : y >= Threshold;
+        static_cast<uint8_t*>(data)[UpOffset] = Up ? 0x80 : 0;
+        static_cast<uint8_t*>(data)[DownOffset] = Down ? 0x80 : 0;
+        return hr;
+    }
+
+    HRESULT __stdcall GetObjectInfoHook(void* device, LPDIDEVICEOBJECTINSTANCEA info, DWORD object, DWORD how)
+    {
+        HRESULT hr = pGetObjectInfo(device, info, object, how);
+        if (SUCCEEDED(hr) || !info || info->dwSize < sizeof(DIDEVICEOBJECTINSTANCEA) || !IsXInputDevice(device))
+            return hr;
+        int button = -1;
+        if (how == DIPH_BYOFFSET && (object == UpOffset || object == DownOffset))
+            button = object - 0x30;
+        else if (how == DIPH_BYID && (object & DIDFT_BUTTON) && (DIDFT_GETINSTANCE(object) == 14 || DIDFT_GETINSTANCE(object) == 15))
+            button = DIDFT_GETINSTANCE(object);
+        if (button < 0)
+            return hr;
+        const DWORD size = info->dwSize;
+        memset(info, 0, size);
+        info->dwSize = size;
+        static const GUID ButtonGuid = { 0xA36D02F0, 0xC9F3, 0x11CF, { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } }; // GUID_Button
+        info->guidType = ButtonGuid;
+        info->dwOfs = 0x30 + button;
+        info->dwType = DIDFT_PSHBUTTON | DIDFT_MAKEINSTANCE(button);
+        strcpy_s(info->tszName, button == 14 ? "Right stick Up" : "Right stick Down");
+        return DI_OK;
+    }
+
+    void Install(int percent)
+    {
+        void** vtable = DInputDeviceVTable();
+        if (!vtable)
+            return;
+        auto devices = hook::pattern("8B 50 08 8B 40 0C 89 51 08 89 41 0C E8 ? ? ? ? 83 C4 14 84 C0 75 06 57"); // Set-up of a controller
+        auto controllers = hook::pattern("BE ? ? ? ? 83 CF FF 8D 49 00 39 BE 30 01 00 00");                     // Its .cfg save loop
+        if (devices.size() == 1)
+            DeviceArray = *devices.get_first<void**>(12 + 0x1B);
+        if (controllers.size() == 1)
+            Controllers = *controllers.get_first<uint8_t*>(1);
+        auto capture = hook::pattern("8B FE E8 ? ? ? ? EB 05 E8"); // mov edi, esi; call (the controls setup's wait for a button or axis)
+        if (capture.size() == 1)
+        {
+            pCapture = injector::GetBranchDestination(capture.get_first(2)).get();
+            injector::MakeCALL(capture.get_first(2), CaptureHook, true);
+        }
+        Enabled = true;
+        Threshold = (std::min)(100, percent) * 100;
+        Release = Threshold * 6 / 10;
+        pGetProperty = (GetPropertyFn)vtable[5];
+        pGetDeviceState = (GetDeviceStateFn)vtable[9];  // Possibly the vibration's, which calls on to DirectInput
+        pGetObjectInfo = (GetObjectInfoFn)vtable[14];
+        injector::WriteMemory(&vtable[9], (void*)GetDeviceStateHook, true);
+        injector::WriteMemory(&vtable[14], (void*)GetObjectInfoHook, true);
+        CloseHandle(CreateThread(NULL, 0, Reader, NULL, 0, NULL));
     }
 }
 
@@ -2364,6 +2635,7 @@ void Init()
     bool bBlackMagazineFix = ReadIniInteger(iniReader, "MISC", "BlackMagazineFix", 1) != 0;
     bool bSaveKeyboardBindings = ReadIniInteger(iniReader, "MISC", "SaveKeyboardBindings", 1) != 0;
     bool bSaveControllerBindings = ReadIniInteger(iniReader, "MISC", "SaveControllerBindings", 1) != 0;
+    int nRightStickButtons = (std::max)(0, ReadIniInteger(iniReader, "MISC", "RightStickButtons", 50));
     int nVibration = (std::max)(0, ReadIniInteger(iniReader, "MISC", "Vibration", 100)); // Above 100 only the weak jolts get stronger
     if (szCustomUserFilesDirectoryInGameDir.empty() || szCustomUserFilesDirectoryInGameDir == "0")
         szCustomUserFilesDirectoryInGameDir.clear();
@@ -2888,6 +3160,8 @@ void Init()
     }
 
     Vibration::Install(nVibration);
+    if (nRightStickButtons)
+        RightStickButtons::Install(nRightStickButtons);
 
     if (nImproveGamepadSupport)
     {
@@ -3116,6 +3390,8 @@ void Init()
                             return names[instance];
                         if (instance == 11)
                             return names[20];
+                        if (RightStickButtons::Enabled && (instance == 14 || instance == 15))
+                            return instance == 14 ? L"Right stick Up" : L"Right stick Down";
                         return L"";
                     }
                     if (type & 0x10) // DIDFT_POV
@@ -3144,6 +3420,8 @@ void Init()
                     return names[number];
                 if (number == 11)
                     return names[20];
+                if (RightStickButtons::Enabled && (number == 14 || number == 15))
+                    return number == 14 ? L"Right stick Up" : L"Right stick Down";
                 return L"";
             }
             for (size_t i = 10; i < Texts.size(); i++)

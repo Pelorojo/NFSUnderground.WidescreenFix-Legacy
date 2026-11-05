@@ -46,6 +46,12 @@ existing settings keep working.
   the defaults. Now the last saved bindings of every controller are also kept in `Controller.map` next to the
   profiles and used when a profile is loaded without bindings for a plugged-in controller (found by the device, or
   by its model, e.g. on another USB port). A profile's own bindings always come first.
+- New `RightStickButtons` option (`[MISC]`, 50 by default, 0 = off, 1 - 100 = how far it has to be pushed, in
+  percent): the right stick of an XInput gamepad pushed up or down also works as two buttons, "Right stick Up" and
+  "Right stick Down", that can be assigned in the controls setup like any button, e.g. to shifting (the game only
+  takes buttons for it). The stick's up/down is one control: giving its axis to throttle or brake takes the two
+  buttons' actions away, and giving one of the buttons an action takes the axis away, as the game does with a
+  button used twice.
 
 ### v1.5
 
