@@ -551,6 +551,215 @@ namespace KeyboardBindings
     }
 }
 
+// The game keeps the bindings of joypads and wheels in the profile's .cfg, a line per device keyed by its instance
+// GUID (loaded by NA/EU 0x41CDA0, saved by 0x41C9E0 from 0x41C9B5; RU +0xE0, +0x20 for the calls). It only writes the
+// devices that are plugged in, so a pad that was missing when the profile was saved is back to the defaults the next
+// time. Controller.map next to the .cfg files remembers the last saved bindings of every device and is only used when
+// a profile is loaded (0x40650A) and its .cfg has nothing for a plugged-in device (profiles can have bindings of their
+// own): first by instance GUID, else by product (the same model, e.g. on another USB port). Not when a controller is
+// set up at the start (0x40642A, no profile yet): there a failed load makes the game set the device up with its
+// defaults (0x4060A0: axes, buttons, the menu controls), which a found entry would skip.
+namespace ControllerBindings
+{
+    typedef int(__cdecl* LoadFn)(DWORD, DWORD, DWORD, DWORD, uint8_t*);
+    typedef void(__cdecl* SaveFn)(FILE*, uint8_t*);
+    LoadFn pLoadProfile = nullptr;
+    SaveFn pSave = nullptr;
+    void** DeviceArray = nullptr;  // The game's IDirectInputDevice8A* per channel (NA/EU 0x71D89C)
+    std::string Folder;            // ...\NFS Underground\ (as the game's .cfg)
+    CRITICAL_SECTION Lock;         // Lines, Pending
+    std::vector<std::string> Lines;
+    bool Loaded = false;
+    std::string Pending;           // File contents for the background thread
+    HANDLE PendingEvent = NULL;
+
+    std::string FilePath() { return Folder + "Controller.map"; }
+
+    // The fields a .cfg line fills in a controller object: 8 ints at +0x244, 5 bytes at +0x264, 32 ints at +0x18
+    constexpr int ValueCount = 8 + 5 + 32;
+
+    std::string Values(const uint8_t* obj)
+    {
+        std::string text;
+        char number[16];
+        for (int i = 0; i < 8; ++i)
+            sprintf_s(number, "%d ", *(const int*)(obj + 0x244 + i * 4)), text += number;
+        for (int i = 0; i < 5; ++i)
+            sprintf_s(number, "%d ", obj[0x264 + i]), text += number;
+        for (int i = 0; i < 32; ++i)
+            sprintf_s(number, "%d ", *(const int*)(obj + 0x18 + i * 4)), text += number;
+        text.pop_back();
+        return text;
+    }
+
+    bool SetValues(uint8_t* obj, const std::string& text)
+    {
+        int values[ValueCount];
+        const char* p = text.c_str();
+        for (int i = 0; i < ValueCount; ++i)
+        {
+            char* end = nullptr;
+            values[i] = strtol(p, &end, 10);
+            if (end == p)
+                return false;
+            p = end;
+        }
+        for (int i = 0; i < 8; ++i)
+            *(int*)(obj + 0x244 + i * 4) = values[i];
+        for (int i = 0; i < 5; ++i)
+            obj[0x264 + i] = (uint8_t)values[8 + i];
+        for (int i = 0; i < 32; ++i)
+            *(int*)(obj + 0x18 + i * 4) = values[13 + i];
+        return true;
+    }
+
+    std::string GuidText(const GUID& g)
+    {
+        char text[48];
+        sprintf_s(text, "{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", g.Data1, g.Data2, g.Data3, g.Data4[0], g.Data4[1],
+            g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+        return text;
+    }
+
+    // The product as VID:PID (DirectInput's guidProduct has the VID in the low and the PID in the high word of Data1)
+    std::string ProductText(const GUID& g)
+    {
+        char text[16];
+        sprintf_s(text, "%04X:%04X", g.Data1 & 0xFFFF, g.Data1 >> 16);
+        return text;
+    }
+
+    bool DeviceInfo(const uint8_t* obj, DIDEVICEINSTANCEA& info)
+    {
+        const int channel = *(const int*)(obj + 0x130);
+        if (!DeviceArray || channel < 0 || channel > 1 || !DeviceArray[channel])
+            return false;
+        info = {};
+        info.dwSize = sizeof(info);
+        return SUCCEEDED(static_cast<IDirectInputDevice8A*>(DeviceArray[channel])->GetDeviceInfo(&info));
+    }
+
+    // Lines: <instance GUID>\t<VID:PID>\t<product name>\t<values>; Lock held
+    void ReadLines()
+    {
+        if (Loaded)
+            return;
+        Loaded = true;
+        if (FILE* f = fopen(FilePath().c_str(), "r"))
+        {
+            char line[1024];
+            while (fgets(line, sizeof(line), f))
+            {
+                std::string text(line);
+                while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+                    text.pop_back();
+                if (std::count(text.begin(), text.end(), '\t') == 3)
+                    Lines.push_back(text);
+            }
+            fclose(f);
+        }
+    }
+
+    std::string Field(const std::string& line, int index)
+    {
+        size_t begin = 0;
+        for (int i = 0; i < index; ++i)
+            begin = line.find('\t', begin) + 1;
+        return line.substr(begin, line.find('\t', begin) - begin);
+    }
+
+    DWORD WINAPI Writer(LPVOID)
+    {
+        for (;;)
+        {
+            WaitForSingleObject(PendingEvent, INFINITE);
+            EnterCriticalSection(&Lock);
+            std::string text;
+            text.swap(Pending);
+            LeaveCriticalSection(&Lock);
+            CreateDirectoryA(Folder.c_str(), NULL);
+            std::string tmp = FilePath() + ".tmp";
+            if (FILE* f = fopen(tmp.c_str(), "w"))
+            {
+                fputs(text.c_str(), f);
+                fclose(f);
+                MoveFileExA(tmp.c_str(), FilePath().c_str(), MOVEFILE_REPLACE_EXISTING);
+            }
+        }
+    }
+
+    int Load(LoadFn original, DWORD g0, DWORD g1, DWORD g2, DWORD g3, uint8_t* obj)
+    {
+        const int result = original(g0, g1, g2, g3, obj);
+        if ((char)result)
+            return result;
+        const DWORD guid[4] = { g0, g1, g2, g3 };
+        GUID instance;
+        memcpy(&instance, guid, sizeof(instance));
+        DIDEVICEINSTANCEA info;
+        const bool product = DeviceInfo(obj, info) && info.guidInstance == instance;
+        const std::string instanceText = GuidText(instance), productText = product ? ProductText(info.guidProduct) : "";
+        std::string values;
+        EnterCriticalSection(&Lock);
+        ReadLines();
+        for (auto it = Lines.rbegin(); it != Lines.rend() && values.empty(); ++it)
+        {
+            if (Field(*it, 0) == instanceText)
+                values = Field(*it, 3);
+        }
+        for (auto it = Lines.rbegin(); it != Lines.rend() && values.empty() && product; ++it)
+        {
+            if (Field(*it, 1) == productText)
+                values = Field(*it, 3);
+        }
+        LeaveCriticalSection(&Lock);
+        if (!values.empty() && SetValues(obj, values))
+            return (result & ~0xFF) | 1;
+        return result;
+    }
+
+    int __cdecl LoadProfileHook(DWORD g0, DWORD g1, DWORD g2, DWORD g3, uint8_t* obj) { return Load(pLoadProfile, g0, g1, g2, g3, obj); }
+
+    void __cdecl SaveHook(FILE* f, uint8_t* obj)
+    {
+        pSave(f, obj);
+        DIDEVICEINSTANCEA info;
+        if (!DeviceInfo(obj, info))
+            return;
+        std::string name = info.tszProductName;
+        std::replace(name.begin(), name.end(), '\t', ' ');
+        const std::string instanceText = GuidText(info.guidInstance);
+        const std::string line = instanceText + "\t" + ProductText(info.guidProduct) + "\t" + name + "\t" + Values(obj);
+        EnterCriticalSection(&Lock);
+        ReadLines();
+        Lines.erase(std::remove_if(Lines.begin(), Lines.end(), [&](const std::string& l) { return Field(l, 0) == instanceText; }), Lines.end());
+        Lines.push_back(line); // The newest last: it wins for the same product
+        Pending.clear();
+        for (auto& l : Lines)
+            Pending += l + "\n";
+        LeaveCriticalSection(&Lock);
+        SetEvent(PendingEvent);
+    }
+
+    void Install(const std::string& folder)
+    {
+        auto loadInit = hook::pattern("8B 50 08 8B 40 0C 89 51 08 89 41 0C E8 ? ? ? ? 83 C4 14 84 C0 75 06 57");
+        auto loadProfile = hook::pattern("8B 50 08 8B 40 0C 89 51 08 89 41 0C E8 ? ? ? ? 83 C4 14 C7 87 98 00 00 00");
+        auto save = hook::pattern("84 C0 75 0A 56 55 E8 ? ? ? ? 83 C4 08 81 C6 70 02 00 00");
+        if (loadInit.size() != 1 || loadProfile.size() != 1 || save.size() != 1)
+            return;
+        Folder = folder;
+        InitializeCriticalSection(&Lock);
+        PendingEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+        CloseHandle(CreateThread(NULL, 0, Writer, NULL, 0, NULL));
+        DeviceArray = *loadInit.get_first<void**>(12 + 0x1B); // cmp [eax*4+devices], ebx after the set-up's load call
+        pLoadProfile = reinterpret_cast<LoadFn>(injector::GetBranchDestination(loadProfile.get_first(12)).as_int());
+        pSave = reinterpret_cast<SaveFn>(injector::GetBranchDestination(save.get_first(6)).as_int());
+        injector::MakeCALL(loadProfile.get_first(12), LoadProfileHook, true);
+        injector::MakeCALL(save.get_first(6), SaveHook, true);
+    }
+}
+
 // Gamepad vibration ([MISC] Vibration) from the game's force feedback. The game plays it with DirectInput effects (its
 // "EZ Wheel Wrapper", NA 0x418D70-0x41C240), only on a device whose axes EnumObjects reports as force feedback
 // actuators (the callback, NA 0x419180, counts them as the channel's effect axes; none = no effects at all). XInput
@@ -2154,6 +2363,7 @@ void Init()
     }
     bool bBlackMagazineFix = ReadIniInteger(iniReader, "MISC", "BlackMagazineFix", 1) != 0;
     bool bSaveKeyboardBindings = ReadIniInteger(iniReader, "MISC", "SaveKeyboardBindings", 1) != 0;
+    bool bSaveControllerBindings = ReadIniInteger(iniReader, "MISC", "SaveControllerBindings", 1) != 0;
     int nVibration = (std::max)(0, ReadIniInteger(iniReader, "MISC", "Vibration", 100)); // Above 100 only the weak jolts get stronger
     if (szCustomUserFilesDirectoryInGameDir.empty() || szCustomUserFilesDirectoryInGameDir == "0")
         szCustomUserFilesDirectoryInGameDir.clear();
@@ -2663,7 +2873,7 @@ void Init()
         }
     }
 
-    if (bSaveKeyboardBindings)
+    if (bSaveKeyboardBindings || bSaveControllerBindings)
     {
         // Where the game keeps its .cfg files: CSIDL_COMMON_APPDATA (or the CustomUserFilesDirectoryInGameDir) + "\NFS Underground\"
         char folder[MAX_PATH] = {};
@@ -2671,7 +2881,10 @@ void Init()
             strcpy_s(folder, szCustomUserFilesDirectoryInGameDir.c_str());
         else
             SHGetFolderPathA(NULL, CSIDL_COMMON_APPDATA | CSIDL_FLAG_CREATE, NULL, 0, folder);
-        KeyboardBindings::Install(std::string(folder) + "\\NFS Underground\\");
+        if (bSaveKeyboardBindings)
+            KeyboardBindings::Install(std::string(folder) + "\\NFS Underground\\");
+        if (bSaveControllerBindings)
+            ControllerBindings::Install(std::string(folder) + "\\NFS Underground\\");
     }
 
     Vibration::Install(nVibration);

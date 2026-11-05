@@ -41,6 +41,11 @@ existing settings keep working.
   (with an invalid period of 0), which not every driver follows, so the effect is stopped then and started again
   with the next surface. Also an effect the game replaces is stopped before it's unloaded. This works with
   `Vibration = 0` too.
+- New `SaveControllerBindings` option (`[MISC]`, on by default): the game keeps the bindings of joypads and wheels in
+  the profile, but only for the devices plugged in when it saves, so a controller that was unplugged then was back to
+  the defaults. Now the last saved bindings of every controller are also kept in `Controller.map` next to the
+  profiles and used when a profile is loaded without bindings for a plugged-in controller (found by the device, or
+  by its model, e.g. on another USB port). A profile's own bindings always come first.
 
 ### v1.5
 
