@@ -566,7 +566,7 @@ namespace KeyboardBindings
 // silent while nothing was asked for 300 ms. The pads go to the XInput slots in the order they were opened.
 namespace Vibration
 {
-    int Strength = 100;   // Percent, 100 = like a DirectInput pad with force feedback (see Compute)
+    int Strength = 100;   // Percent, scales both motors (see Compute)
 
     using XInputGetCapabilities_t = DWORD(WINAPI*)(DWORD, DWORD, XINPUT_CAPABILITIES*);
     using XInputSetState_t = DWORD(WINAPI*)(DWORD, XINPUT_VIBRATION*);
@@ -761,7 +761,10 @@ namespace Vibration
             const bool asked = now - d.lastAsked < 300;
             for (Effect* e : d.effects)
             {
-                if (!e->periodic || !e->Playing(now))
+                // A jolt plays at least 350 ms on the motor (the game's 150 ms hardly get it going)
+                const bool jolt = e->periodic && e->duration != INFINITE && e->playing &&
+                    now - e->started < (std::max)(e->duration / 1000, (DWORD)350);
+                if (!e->periodic || (!e->Playing(now) && !jolt))
                     continue;
                 const DWORD level = e->magnitude * e->gain / 10000;
                 if (e->duration != INFINITE)
@@ -770,16 +773,14 @@ namespace Vibration
                     high = (std::max)(high, level);
             }
         }
-        // Strength 100 = what felt like an original Xbox Controller S with its own force feedback driver (compared
-        // with an Xbox 360 pad), cut at full speed. The jolts go by the square root of their magnitude, twice that:
-        // most are below 16 % (landings, bumps; walls only from a sudden drop in speed), and a 150 ms jolt that weak
-        // hardly gets the big motor going. So 1 % gives 20 %, 4 % 40 %, 16 % 80 %, 25 % and more full speed. The
-        // surface rumble goes by its magnitude times 1.2 (gravel 51 % -> 61 %; twice it was far stronger than on
-        // the Controller S, where gravel is hardly felt).
-        const auto speed = [&](double share) { return (WORD)((std::min)(1.0, share * Strength / 100) * 65535); };
+        // Both motors go by 1.5 x magnitude ^ 0.75 at Strength 100, cut at full speed (tuned by feel on an Xbox 360
+        // pad): the weak jolts are raised more than the strong ones (most are below 16 %: bumps, landings; walls only
+        // from a sudden drop in speed), and the surfaces keep their order. Jolts: 1 % gives 5 %, 4 % 13 %,
+        // 16 % 38 %, 58 % and more full speed. Surfaces: 20 % gives 45 %, curbs 39 % 74 %, gravel 51 % 91 %.
+        const auto speed = [&](double share) { return (WORD)((std::min)(1.0, 1.5 * std::pow(share, 0.75) * Strength / 100) * 65535); };
         const double gainShare = d.gain / 10000.0;
-        d.low = speed(2.0 * std::sqrt(low / 10000.0 * gainShare));
-        d.high = speed(1.2 * high / 10000.0 * gainShare);
+        d.low = speed(low / 10000.0 * gainShare);
+        d.high = speed(high / 10000.0 * gainShare);
         d.lastRead = GetTickCount();
     }
 

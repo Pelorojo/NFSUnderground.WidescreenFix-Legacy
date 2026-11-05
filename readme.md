@@ -31,9 +31,9 @@ existing settings keep working.
   feedback, which XInput pads aren't on the DirectInput side, so for them the fix takes the effects and sets the
   pad's motors: the jolts from hits and landings on the big motor, the rumble of the surface (gravel, grass, curbs)
   on the small one. Steering forces have no match on a pad and are left out, as a DirectInput pad with force
-  feedback does too. Weak jolts are raised more than strong ones (by the square root of their strength), so that
-  bumps and landings are felt like on such a pad. Nothing changes for wheels and pads with force feedback of their
-  own.
+  feedback does too. Both motors follow the same curve, which raises weak effects more than strong ones, so that
+  bumps are felt and hard landings and crashes still stand out, and a jolt runs at least 350 ms (the game's 150 ms
+  hardly get a motor going). Nothing changes for wheels and pads with force feedback of their own.
 - Under Wine the motors run out after one second and the same speed isn't passed on again, so there a running
   motor gets its speed again every half second.
 - Devices with force feedback of their own (e.g. an original Xbox Controller S, wheels) no longer keep vibrating
