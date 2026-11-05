@@ -1009,6 +1009,9 @@ namespace Vibration
     //   magnitude again. While it is silent the game's own Start calls on it (it sees it isn't playing) are left out.
     // - When the surface changes the waveform it replaces the effect with Unload alone and then forgets it.
     //   DirectInput says Unload stops the effect, but not every driver does, so the effect is stopped first.
+    // - It changes the effects without acquiring the device first (it only does so before Start and Stop), so the
+    //   change can stay on hold (DI_DOWNLOADSKIPPED) until the next Start: on gravel the rumble then only began
+    //   after the next jump. A periodic effect's change on hold is downloaded with the device acquired.
     // Stop and Start need the device acquired (the game acquires it before its own Start and Stop calls too).
     // The effect objects come from DirectInput, one vtable per implementation.
     typedef HRESULT(__stdcall* EffectFn)(IDirectInputEffect*);
@@ -1020,7 +1023,7 @@ namespace Vibration
         void** vtable;
         EffectSetParametersFn setParameters;
         EffectStartFn start;
-        EffectFn stop, unload;
+        EffectFn stop, download, unload;
     };
     EffectVTable EffectVTables[4] = {};
     struct RealEffect
@@ -1029,6 +1032,7 @@ namespace Vibration
         bool silent;     // Periodic, magnitude 0, stopped here
     };
     std::unordered_map<IDirectInputEffect*, RealEffect> RealEffects; // Lock
+    void* CreatingFor = nullptr; // Game thread: device whose CreateEffect is running (it sets the first parameters)
 
     const EffectVTable* VTableOf(IDirectInputEffect* e)
     {
@@ -1051,7 +1055,8 @@ namespace Vibration
             reinterpret_cast<AcquireFn>((*reinterpret_cast<void***>(device))[7])(device);
     }
 
-    // Returns the previous silent state
+    // Returns the previous silent state. An effect still being created is added here: DirectInput sets its first
+    // parameters through the same vtable before CreateEffect returns.
     bool SetSilent(IDirectInputEffect* e, bool silent)
     {
         EnterCriticalSection(&Lock);
@@ -1062,6 +1067,8 @@ namespace Vibration
             was = it->second.silent;
             it->second.silent = silent;
         }
+        else if (CreatingFor)
+            RealEffects[e] = RealEffect{ CreatingFor, silent };
         LeaveCriticalSection(&Lock);
         return was;
     }
@@ -1129,13 +1136,20 @@ namespace Vibration
             AcquireDeviceOf(e);
             v->start(e, 1, 0);
         }
+        else if (hr == DI_DOWNLOADSKIPPED && !silent && !(flags & DIEP_NODOWNLOAD))
+        {
+            AcquireDeviceOf(e);
+            if (SUCCEEDED(v->download(e)))
+                hr = DI_OK;
+        }
         return hr;
     }
 
     void FixEffects(void* device, IDirectInputEffect* e)
     {
         EnterCriticalSection(&Lock);
-        RealEffects[e] = RealEffect{ device, false };
+        if (RealEffects.find(e) == RealEffects.end())
+            RealEffects[e] = RealEffect{ device, false };
         LeaveCriticalSection(&Lock);
         void** vtable = *reinterpret_cast<void***>(e);
         for (auto& v : EffectVTables)
@@ -1147,6 +1161,7 @@ namespace Vibration
                 v.setParameters = (EffectSetParametersFn)vtable[6];
                 v.start = (EffectStartFn)vtable[7];
                 v.stop = (EffectFn)vtable[8];
+                v.download = (EffectFn)vtable[10];
                 v.unload = (EffectFn)vtable[11];
                 v.vtable = vtable;
                 injector::WriteMemory(&vtable[6], (void*)SetParametersHook, true);
@@ -1161,7 +1176,9 @@ namespace Vibration
     {
         if (!IsFake(device))
         {
+            CreatingFor = device;
             HRESULT hr = pCreateEffect(device, guid, params, effect, outer);
+            CreatingFor = nullptr;
             if (SUCCEEDED(hr) && effect && *effect)
             {
                 FixEffects(device, *effect);
