@@ -447,34 +447,90 @@ void** DInputDeviceVTable()
 // with it the game freezes on some PCs, so without it the keyboard was back to the defaults on every start. These two
 // calls are taken over on the device vtable (shared by every IDirectInputDevice8A, but only the keyboard uses them):
 // a SetActionMap with DIDSAM_FORCESAVE also writes the format's actions to Keyboard.map next to the game's .cfg files,
-// and after BuildActionMap they are put back (same index, uAppData and dwSemantic, so a changed format is ignored)
+// and after BuildActionMap they are put back (same index, uAppData and dwSemantic, so a changed format is ignored).
+// The file is read once and kept in memory; a background thread writes it (on a slow drive closing it took 71 ms in
+// the game thread)
 namespace KeyboardBindings
 {
     typedef HRESULT(__stdcall* ActionMapFn)(void* pDevice, LPDIACTIONFORMATA lpdiaf, LPCSTR lpszUserName, DWORD dwFlags);
     ActionMapFn pBuildActionMap = nullptr;
     ActionMapFn pSetActionMap = nullptr;
     std::string Folder; // ...\NFS Underground\ (as the game's .cfg), set in Init
+    CRITICAL_SECTION Lock; // Lines, Pending
+    std::vector<std::string> Lines;
+    bool Loaded = false;
+    std::string Pending; // File contents for the background thread
+    HANDLE PendingEvent = NULL;
 
     std::string FilePath() { return Folder + "Keyboard.map"; }
 
     // Lines: <format name>\t<index>\t<uAppData>\t<dwSemantic>\t<dwObjID>\t<dwHow>
     std::vector<std::string> ReadLines()
     {
-        std::vector<std::string> lines;
-        if (FILE* f = fopen(FilePath().c_str(), "r"))
+        EnterCriticalSection(&Lock);
+        if (!Loaded)
         {
-            char line[512];
-            while (fgets(line, sizeof(line), f))
+            Loaded = true;
+            if (FILE* f = fopen(FilePath().c_str(), "r"))
             {
-                std::string text(line);
-                while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
-                    text.pop_back();
-                if (!text.empty())
-                    lines.push_back(text);
+                char line[512];
+                while (fgets(line, sizeof(line), f))
+                {
+                    std::string text(line);
+                    while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+                        text.pop_back();
+                    if (!text.empty())
+                        Lines.push_back(text);
+                }
+                fclose(f);
             }
-            fclose(f);
         }
+        std::vector<std::string> lines = Lines;
+        LeaveCriticalSection(&Lock);
         return lines;
+    }
+
+    // The contents go to a .tmp file first, then replace the file; the job is only dropped once that is done, so a
+    // job the game's exit cut short is written by Flush (DLL_PROCESS_DETACH)
+    void Write(const std::string& text)
+    {
+        CreateDirectoryA(Folder.c_str(), NULL);
+        std::string tmp = FilePath() + ".tmp";
+        if (FILE* f = fopen(tmp.c_str(), "w"))
+        {
+            fputs(text.c_str(), f);
+            fclose(f);
+            MoveFileExA(tmp.c_str(), FilePath().c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+
+    DWORD WINAPI Writer(LPVOID)
+    {
+        for (;;)
+        {
+            WaitForSingleObject(PendingEvent, INFINITE);
+            EnterCriticalSection(&Lock);
+            std::string text = Pending;
+            LeaveCriticalSection(&Lock);
+            if (text.empty())
+                continue;
+            Write(text);
+            EnterCriticalSection(&Lock);
+            if (Pending == text)
+                Pending.clear();
+            LeaveCriticalSection(&Lock);
+        }
+    }
+
+    void Flush()
+    {
+        if (!PendingEvent || !TryEnterCriticalSection(&Lock)) // The writer's thread may have died holding it
+            return;
+        std::string text;
+        text.swap(Pending);
+        LeaveCriticalSection(&Lock);
+        if (!text.empty())
+            Write(text);
     }
 
     void Save(LPDIACTIONFORMATA lpdiaf)
@@ -493,15 +549,13 @@ namespace KeyboardBindings
             sprintf_s(line, "%s\t%u\t%u\t%u\t%u\t%u", name.c_str(), i, (unsigned)action.uAppData, action.dwSemantic, action.dwObjID, action.dwHow);
             lines.push_back(line);
         }
-        CreateDirectoryA(Folder.c_str(), NULL);
-        std::string tmp = FilePath() + ".tmp";
-        if (FILE* f = fopen(tmp.c_str(), "w"))
-        {
-            for (auto& line : lines)
-                fprintf(f, "%s\n", line.c_str());
-            fclose(f);
-            MoveFileExA(tmp.c_str(), FilePath().c_str(), MOVEFILE_REPLACE_EXISTING);
-        }
+        EnterCriticalSection(&Lock);
+        Lines = lines;
+        Pending.clear();
+        for (auto& line : Lines)
+            Pending += line + "\n";
+        LeaveCriticalSection(&Lock);
+        SetEvent(PendingEvent);
     }
 
     void Restore(LPDIACTIONFORMATA lpdiaf)
@@ -545,6 +599,9 @@ namespace KeyboardBindings
         void** vtable = DInputDeviceVTable();
         if (!vtable)
             return;
+        InitializeCriticalSection(&Lock);
+        PendingEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+        CloseHandle(CreateThread(NULL, 0, Writer, NULL, 0, NULL));
         pBuildActionMap = (ActionMapFn)vtable[29]; // 0x74
         pSetActionMap = (ActionMapFn)vtable[30];   // 0x78
         injector::WriteMemory(&vtable[29], (void*)BuildActionMapHook, true);
@@ -669,24 +726,47 @@ namespace ControllerBindings
         return line.substr(begin, line.find('\t', begin) - begin);
     }
 
+    // The contents go to a .tmp file first, then replace the file; the job is only dropped once that is done, so a
+    // job the game's exit cut short is written by Flush (DLL_PROCESS_DETACH)
+    void Write(const std::string& text)
+    {
+        CreateDirectoryA(Folder.c_str(), NULL);
+        std::string tmp = FilePath() + ".tmp";
+        if (FILE* f = fopen(tmp.c_str(), "w"))
+        {
+            fputs(text.c_str(), f);
+            fclose(f);
+            MoveFileExA(tmp.c_str(), FilePath().c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+
     DWORD WINAPI Writer(LPVOID)
     {
         for (;;)
         {
             WaitForSingleObject(PendingEvent, INFINITE);
             EnterCriticalSection(&Lock);
-            std::string text;
-            text.swap(Pending);
+            std::string text = Pending;
             LeaveCriticalSection(&Lock);
-            CreateDirectoryA(Folder.c_str(), NULL);
-            std::string tmp = FilePath() + ".tmp";
-            if (FILE* f = fopen(tmp.c_str(), "w"))
-            {
-                fputs(text.c_str(), f);
-                fclose(f);
-                MoveFileExA(tmp.c_str(), FilePath().c_str(), MOVEFILE_REPLACE_EXISTING);
-            }
+            if (text.empty())
+                continue;
+            Write(text);
+            EnterCriticalSection(&Lock);
+            if (Pending == text)
+                Pending.clear();
+            LeaveCriticalSection(&Lock);
         }
+    }
+
+    void Flush()
+    {
+        if (!PendingEvent || !TryEnterCriticalSection(&Lock)) // The writer's thread may have died holding it
+            return;
+        std::string text;
+        text.swap(Pending);
+        LeaveCriticalSection(&Lock);
+        if (!text.empty())
+            Write(text);
     }
 
     int Load(LoadFn original, DWORD g0, DWORD g1, DWORD g2, DWORD g3, uint8_t* obj)
@@ -3799,6 +3879,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, uint32_t reason, LPVOID lpReserved)
     if (reason == DLL_PROCESS_ATTACH)
     {
 
+    }
+    else if (reason == DLL_PROCESS_DETACH && lpReserved) // The game exits: write what the background threads didn't
+    {
+        KeyboardBindings::Flush();
+        ControllerBindings::Flush();
     }
     return TRUE;
 }

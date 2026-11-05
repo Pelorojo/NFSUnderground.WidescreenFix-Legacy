@@ -54,6 +54,9 @@ existing settings keep working.
   button used twice.
 - `ImproveGamepadSupport`: while the controls setup waits for a button to assign, the pad buttons no longer also
   work as menu keys, so assigning Y no longer asks whether to go back to the default settings.
+- `SaveKeyboardBindings`: `Keyboard.map` is read once and written by a background thread (on a slow drive saving
+  it could stall the game for a moment when going between menu and race); a save cut short by quitting the game is
+  finished when it exits. The same for `Controller.map`.
 
 ### v1.5
 
