@@ -2716,7 +2716,7 @@ void Init()
     bool bSaveKeyboardBindings = ReadIniInteger(iniReader, "MISC", "SaveKeyboardBindings", 1) != 0;
     bool bSaveControllerBindings = ReadIniInteger(iniReader, "MISC", "SaveControllerBindings", 1) != 0;
     int nRightStickButtons = (std::max)(0, ReadIniInteger(iniReader, "MISC", "RightStickButtons", 50));
-    int nVibration = (std::max)(0, ReadIniInteger(iniReader, "MISC", "Vibration", 100)); // Above 100 only the weak jolts get stronger
+    int nVibration = (std::max)(0, ReadIniInteger(iniReader, "MISC", "Vibration", 100)); // Above 100 everything gets stronger up to full speed
     if (szCustomUserFilesDirectoryInGameDir.empty() || szCustomUserFilesDirectoryInGameDir == "0")
         szCustomUserFilesDirectoryInGameDir.clear();
     int nWindowedMode = ReadIniInteger(iniReader, "MISC", "WindowedMode", 0);

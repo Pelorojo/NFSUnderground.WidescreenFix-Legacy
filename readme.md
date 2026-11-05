@@ -24,7 +24,7 @@ existing settings keep working.
 
 ## Changes
 
-### Next version
+### v1.6
 
 - New `Vibration` option (`[MISC]`, 100 by default, 0 = off, 1 - 100 = strength in percent): XInput gamepads
   vibrate with the game's force feedback, also under Wine. The game only plays it on DirectInput devices with force
@@ -47,11 +47,11 @@ existing settings keep working.
   profiles and used when a profile is loaded without bindings for a plugged-in controller (found by the device, or
   by its model, e.g. on another USB port). A profile's own bindings always come first.
 - New `RightStickButtons` option (`[MISC]`, 50 by default, 0 = off, 1 - 100 = how far it has to be pushed, in
-  percent): the right stick of an XInput gamepad pushed up or down also works as two buttons, "Right stick Up" and
-  "Right stick Down", that can be assigned in the controls setup like any button, e.g. to shifting (the game only
-  takes buttons for it). The stick's up/down is one control: giving its axis to throttle or brake takes the two
-  buttons' actions away, and giving one of the buttons an action takes the axis away, as the game does with a
-  button used twice.
+  percent): the right stick of an XInput gamepad pushed up or down also works as two buttons (named "Right stick Up"
+  and "Right stick Down" with `ImproveGamepadSupport`, else "Button 14" and "Button 15") that can be assigned in the
+  controls setup like any button, e.g. to shifting (the game only takes buttons for it). The stick's up/down is
+  one control: giving its axis to throttle or brake takes the two buttons' actions away, and giving one of the
+  buttons an action takes the axis away, as the game does with a button used twice.
 - `ImproveGamepadSupport`: while the controls setup waits for a button to assign, the pad buttons no longer also
   work as menu keys, so assigning Y no longer asks whether to go back to the default settings.
 - `SaveKeyboardBindings`: `Keyboard.map` is read once and written by a background thread (on a slow drive saving
