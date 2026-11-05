@@ -2,6 +2,7 @@
 #include "GTA\CFileMgr.h"
 #include <d3d9.h>
 #include <algorithm>
+#include <unordered_map>
 #include <cmath>
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
@@ -565,7 +566,7 @@ namespace KeyboardBindings
 // silent while nothing was asked for 300 ms. The pads go to the XInput slots in the order they were opened.
 namespace Vibration
 {
-    int Strength = 100;   // Percent, 100 = twice the effects' magnitude
+    int Strength = 100;   // Percent, 100 = like a DirectInput pad with force feedback (see Compute)
 
     using XInputGetCapabilities_t = DWORD(WINAPI*)(DWORD, DWORD, XINPUT_CAPABILITIES*);
     using XInputSetState_t = DWORD(WINAPI*)(DWORD, XINPUT_VIBRATION*);
@@ -769,16 +770,16 @@ namespace Vibration
                     high = (std::max)(high, level);
             }
         }
-        // Strength 100 = twice the effect's magnitude (tested: the plain magnitude is too weak on a pad; the surface
-        // rumble is then already at full speed, so more makes no difference), cut at full speed. The jolts go by the
-        // square root of their magnitude: most are below 16 % (landings, bumps; walls only from a sudden drop in speed),
-        // and a 150 ms jolt that weak hardly gets the big motor going, while a DirectInput pad with force feedback
-        // (original Xbox Controller S) makes them clearly felt. So 1 % gives 20 %, 4 % 40 %, 16 % 80 %, 25 % and more
-        // full speed.
-        const auto speed = [&](double share) { return (WORD)((std::min)(1.0, share * Strength * 2 / 100) * 65535); };
+        // Strength 100 = what felt like an original Xbox Controller S with its own force feedback driver (compared
+        // with an Xbox 360 pad), cut at full speed. The jolts go by the square root of their magnitude, twice that:
+        // most are below 16 % (landings, bumps; walls only from a sudden drop in speed), and a 150 ms jolt that weak
+        // hardly gets the big motor going. So 1 % gives 20 %, 4 % 40 %, 16 % 80 %, 25 % and more full speed. The
+        // surface rumble goes by its magnitude times 1.2 (gravel 51 % -> 61 %; twice it was far stronger than on
+        // the Controller S, where gravel is hardly felt).
+        const auto speed = [&](double share) { return (WORD)((std::min)(1.0, share * Strength / 100) * 65535); };
         const double gainShare = d.gain / 10000.0;
-        d.low = speed(std::sqrt(low / 10000.0 * gainShare));
-        d.high = speed(high / 10000.0 * gainShare);
+        d.low = speed(2.0 * std::sqrt(low / 10000.0 * gainShare));
+        d.high = speed(1.2 * high / 10000.0 * gainShare);
         d.lastRead = GetTickCount();
     }
 
@@ -1000,10 +1001,173 @@ namespace Vibration
         return hr;
     }
 
+    // Three things the game does with the effects of a device with force feedback of its own that a driver may not
+    // take as meant (on an original Xbox Controller S the gravel rumble kept going until the window lost focus):
+    // - It switches the surface rumble off by setting magnitude 0 and period 0 (NA 0x429620 -> 0x41B210) and leaves
+    //   the effect playing. A period of 0 is no valid period, so a valid one is put in, and as that alone didn't
+    //   stop the rumble, a periodic effect set to magnitude 0 is stopped, and started again when the game gives it a
+    //   magnitude again. While it is silent the game's own Start calls on it (it sees it isn't playing) are left out.
+    // - When the surface changes the waveform it replaces the effect with Unload alone and then forgets it.
+    //   DirectInput says Unload stops the effect, but not every driver does, so the effect is stopped first.
+    // Stop and Start need the device acquired (the game acquires it before its own Start and Stop calls too).
+    // The effect objects come from DirectInput, one vtable per implementation.
+    typedef HRESULT(__stdcall* EffectFn)(IDirectInputEffect*);
+    typedef HRESULT(__stdcall* EffectSetParametersFn)(IDirectInputEffect*, LPCDIEFFECT, DWORD);
+    typedef HRESULT(__stdcall* EffectStartFn)(IDirectInputEffect*, DWORD, DWORD);
+    typedef HRESULT(__stdcall* AcquireFn)(void*);
+    struct EffectVTable
+    {
+        void** vtable;
+        EffectSetParametersFn setParameters;
+        EffectStartFn start;
+        EffectFn stop, unload;
+    };
+    EffectVTable EffectVTables[4] = {};
+    struct RealEffect
+    {
+        void* device;
+        bool silent;     // Periodic, magnitude 0, stopped here
+    };
+    std::unordered_map<IDirectInputEffect*, RealEffect> RealEffects; // Lock
+
+    const EffectVTable* VTableOf(IDirectInputEffect* e)
+    {
+        void** vtable = *reinterpret_cast<void***>(e);
+        for (const auto& v : EffectVTables)
+        {
+            if (v.vtable == vtable)
+                return &v;
+        }
+        return nullptr;
+    }
+
+    void AcquireDeviceOf(IDirectInputEffect* e)
+    {
+        EnterCriticalSection(&Lock);
+        auto it = RealEffects.find(e);
+        void* device = it != RealEffects.end() ? it->second.device : nullptr;
+        LeaveCriticalSection(&Lock);
+        if (device)
+            reinterpret_cast<AcquireFn>((*reinterpret_cast<void***>(device))[7])(device);
+    }
+
+    // Returns the previous silent state
+    bool SetSilent(IDirectInputEffect* e, bool silent)
+    {
+        EnterCriticalSection(&Lock);
+        bool was = false;
+        auto it = RealEffects.find(e);
+        if (it != RealEffects.end())
+        {
+            was = it->second.silent;
+            it->second.silent = silent;
+        }
+        LeaveCriticalSection(&Lock);
+        return was;
+    }
+
+    bool IsSilent(IDirectInputEffect* e)
+    {
+        EnterCriticalSection(&Lock);
+        auto it = RealEffects.find(e);
+        bool silent = it != RealEffects.end() && it->second.silent;
+        LeaveCriticalSection(&Lock);
+        return silent;
+    }
+
+    HRESULT __stdcall UnloadHook(IDirectInputEffect* e)
+    {
+        const EffectVTable* v = VTableOf(e);
+        if (!v)
+            return DIERR_GENERIC;
+        AcquireDeviceOf(e);
+        v->stop(e);
+        SetSilent(e, false);
+        return v->unload(e);
+    }
+
+    HRESULT __stdcall StartHook(IDirectInputEffect* e, DWORD iterations, DWORD flags)
+    {
+        const EffectVTable* v = VTableOf(e);
+        if (!v)
+            return DIERR_GENERIC;
+        if (IsSilent(e))
+            return DI_OK;
+        return v->start(e, iterations, flags);
+    }
+
+    HRESULT __stdcall SetParametersHook(IDirectInputEffect* e, LPCDIEFFECT p, DWORD flags)
+    {
+        const EffectVTable* v = VTableOf(e);
+        if (!v)
+            return DIERR_GENERIC;
+        if (!p || !(flags & DIEP_TYPESPECIFICPARAMS) || !p->lpvTypeSpecificParams || p->cbTypeSpecificParams != sizeof(DIPERIODIC) ||
+            p->dwSize > sizeof(DIEFFECT))
+            return v->setParameters(e, p, flags);
+
+        DIEFFECT copy = {};
+        memcpy(&copy, p, p->dwSize);
+        DIPERIODIC periodic = *static_cast<const DIPERIODIC*>(p->lpvTypeSpecificParams);
+        if (periodic.dwPeriod == 0)
+            periodic.dwPeriod = 20000; // 20 ms, a period the game uses itself
+        copy.lpvTypeSpecificParams = &periodic;
+        const bool silent = periodic.dwMagnitude == 0;
+        DWORD ownFlags = flags;
+        if (silent)
+            ownFlags &= ~(DWORD)DIEP_START;
+        HRESULT hr = v->setParameters(e, &copy, ownFlags);
+        if (FAILED(hr))
+            return hr;
+        const bool wasSilent = SetSilent(e, silent);
+        if (silent && !wasSilent)
+        {
+            AcquireDeviceOf(e);
+            v->stop(e);
+        }
+        else if (!silent && wasSilent && !(flags & DIEP_START))
+        {
+            AcquireDeviceOf(e);
+            v->start(e, 1, 0);
+        }
+        return hr;
+    }
+
+    void FixEffects(void* device, IDirectInputEffect* e)
+    {
+        EnterCriticalSection(&Lock);
+        RealEffects[e] = RealEffect{ device, false };
+        LeaveCriticalSection(&Lock);
+        void** vtable = *reinterpret_cast<void***>(e);
+        for (auto& v : EffectVTables)
+        {
+            if (v.vtable == vtable)
+                return;
+            if (!v.vtable)
+            {
+                v.setParameters = (EffectSetParametersFn)vtable[6];
+                v.start = (EffectStartFn)vtable[7];
+                v.stop = (EffectFn)vtable[8];
+                v.unload = (EffectFn)vtable[11];
+                v.vtable = vtable;
+                injector::WriteMemory(&vtable[6], (void*)SetParametersHook, true);
+                injector::WriteMemory(&vtable[7], (void*)StartHook, true);
+                injector::WriteMemory(&vtable[11], (void*)UnloadHook, true);
+                return;
+            }
+        }
+    }
+
     HRESULT __stdcall CreateEffectHook(void* device, REFGUID guid, LPCDIEFFECT params, LPDIRECTINPUTEFFECT* effect, LPUNKNOWN outer)
     {
         if (!IsFake(device))
-            return pCreateEffect(device, guid, params, effect, outer);
+        {
+            HRESULT hr = pCreateEffect(device, guid, params, effect, outer);
+            if (SUCCEEDED(hr) && effect && *effect)
+            {
+                FixEffects(device, *effect);
+            }
+            return hr;
+        }
         if (!effect)
             return E_POINTER;
         auto e = new Effect(device, guid);
@@ -1034,18 +1198,24 @@ namespace Vibration
         return DI_OK;
     }
 
+    // strength 0: only the Unload fix for devices with force feedback of their own
     void Install(int strength)
     {
         void** vtable = DInputDeviceVTable();
-        HMODULE xinput = LoadLibraryA("XInput9_1_0.dll");
-        if (!vtable || !xinput)
+        if (!vtable)
+            return;
+        InitializeCriticalSection(&Lock);
+        pCreateEffect = (CreateEffectFn)vtable[18];
+        injector::WriteMemory(&vtable[18], (void*)CreateEffectHook, true);
+
+        HMODULE xinput = strength > 0 ? LoadLibraryA("XInput9_1_0.dll") : nullptr;
+        if (!xinput)
             return;
         pXGetCapabilities = reinterpret_cast<XInputGetCapabilities_t>(GetProcAddress(xinput, "XInputGetCapabilities"));
         pXSetState = reinterpret_cast<XInputSetState_t>(GetProcAddress(xinput, "XInputSetState"));
         if (!pXGetCapabilities || !pXSetState)
             return;
         Strength = strength;
-        InitializeCriticalSection(&Lock);
 
         pRelease = (ReleaseFn)vtable[2];
         pGetCapabilities = (GetCapabilitiesFn)vtable[3];
@@ -1054,7 +1224,6 @@ namespace Vibration
         pSetProperty = (PropertyFn)vtable[6];
         pUnacquire = (UnacquireFn)vtable[8];
         pGetDeviceState = (GetDeviceStateFn)vtable[9];
-        pCreateEffect = (CreateEffectFn)vtable[18];
         pSendForceFeedbackCommand = (CommandFn)vtable[22];
         injector::WriteMemory(&vtable[2], (void*)ReleaseHook, true);
         injector::WriteMemory(&vtable[4], (void*)EnumObjectsHook, true);
@@ -1062,7 +1231,6 @@ namespace Vibration
         injector::WriteMemory(&vtable[6], (void*)SetPropertyHook, true);
         injector::WriteMemory(&vtable[8], (void*)UnacquireHook, true);
         injector::WriteMemory(&vtable[9], (void*)GetDeviceStateHook, true);
-        injector::WriteMemory(&vtable[18], (void*)CreateEffectHook, true);
         injector::WriteMemory(&vtable[22], (void*)SendForceFeedbackCommandHook, true);
         CloseHandle(CreateThread(NULL, 0, Worker, NULL, 0, NULL));
     }
@@ -2488,8 +2656,7 @@ void Init()
         KeyboardBindings::Install(std::string(folder) + "\\NFS Underground\\");
     }
 
-    if (nVibration)
-        Vibration::Install(nVibration);
+    Vibration::Install(nVibration);
 
     if (nImproveGamepadSupport)
     {

@@ -36,6 +36,11 @@ existing settings keep working.
   own.
 - Under Wine the motors run out after one second and the same speed isn't passed on again, so there a running
   motor gets its speed again every half second.
+- Devices with force feedback of their own (e.g. an original Xbox Controller S, wheels) no longer keep vibrating
+  after leaving gravel and other surfaces: the game switches the surface rumble off by setting its strength to 0
+  (with an invalid period of 0), which not every driver follows, so the effect is stopped then and started again
+  with the next surface. Also an effect the game replaces is stopped before it's unloaded. This works with
+  `Vibration = 0` too.
 
 ### v1.5
 
@@ -160,5 +165,8 @@ after each build.
   [miniz](https://github.com/richgel999/miniz) (MIT) – for the button themes.
 - Button icons of the shipped themes: [Input Prompts](https://kenney.nl/assets/input-prompts) by
   [Kenney](https://www.kenney.nl) (CC0, license in `textures/kenney-input-prompts`).
+- Thanks to [dmitriymolokov](https://github.com/dmitriymolokov) for the
+  [NFSU1 `Speed.exe` research dump](https://github.com/dmitriymolokov/nfsu-research-dump) (Ghidra pseudo-C of the
+  game), which helped a lot to find the game's force feedback code for the vibration.
 
 MIT License, see [license](license). The original copyright notice is kept unchanged.
