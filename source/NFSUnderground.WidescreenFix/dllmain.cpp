@@ -3268,6 +3268,25 @@ void Init()
 
         pattern = hook::pattern("7C ? 5F 5D 5E 33 C0 5B C2 08 00"); //0x41989E
         injector::WriteMemory(pattern.count(1).get(0).get<uint32_t>(8 + 5), 0x900008C2, true);
+        // While the controls setup waits for a button or axis to assign (a controller object's action at +0x23C, 6
+        // objects of 0x270, NA/EU 0x78DA98 / 0x78DAA8, RU 0x78DFF8) and shortly after (it takes the button in the
+        // same frame, maybe before this runs) no keys from pad buttons, or Y (Z) also asked whether to go back to the
+        // default settings
+        static uint8_t* pControllerObjects = nullptr;
+        if (auto controllers = hook::pattern("BE ? ? ? ? 83 CF FF 8D 49 00 39 BE 30 01 00 00"); controllers.size() == 1)
+            pControllerObjects = *controllers.get_first<uint8_t*>(1);
+        static auto WaitingForBinding = []() -> bool
+        {
+            static DWORD lastWaiting = 0;
+            const DWORD now = GetTickCount();
+            for (int i = 0; pControllerObjects && i < 6; ++i)
+            {
+                if (*(const int*)(pControllerObjects + i * 0x270 + 0x23C) != 0)
+                    lastWaiting = now;
+            }
+            return lastWaiting && now - lastWaiting < 250;
+        };
+
         struct CatchPad
         {
             void operator()(injector::reg_pack& regs)
@@ -3276,13 +3295,14 @@ void Init()
                 if (PadKeyPresses != nullptr && PadKeyPresses != (PadState*)0x1 && nGameState == 3)
                 {
                     PadKeys& keys = DevicePadKeys[PadKeyPresses];
+                    const bool waiting = WaitingForBinding();
 
                     const bool Y = PadKeyPresses->Y != 0, X = PadKeyPresses->X != 0, Select = PadKeyPresses->Select != 0;
-                    if (Y && !keys.Y)
+                    if (Y && !keys.Y && !waiting)
                         SendKey('Z');
-                    if (X && !keys.X)
+                    if (X && !keys.X && !waiting)
                         SendKey('P');
-                    if (Select && !keys.Select)
+                    if (Select && !keys.Select && !waiting)
                     {
                         SendKey('C');
                         VinylColor::Send(); // The C above may come too short to be seen by VinylColor::PollKeyboard
@@ -3294,14 +3314,14 @@ void Init()
                     const bool LS = PadKeyPresses->LSClick != 0, RS = PadKeyPresses->RSClick != 0;
                     if (LS && RS)
                     {
-                        if (!keys.Q)
+                        if (!keys.Q && !waiting)
                             SendKey('Q');
                         keys.both = true;
                     }
                     keys.Q = LS && RS;
-                    if (!LS && keys.LS && !keys.both)
+                    if (!LS && keys.LS && !keys.both && !waiting)
                         SendKey('T');
-                    if (!RS && keys.RS && !keys.both)
+                    if (!RS && keys.RS && !keys.both && !waiting)
                         SendKey('D');
                     if (!LS && !RS)
                         keys.both = false;

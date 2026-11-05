@@ -52,6 +52,8 @@ existing settings keep working.
   takes buttons for it). The stick's up/down is one control: giving its axis to throttle or brake takes the two
   buttons' actions away, and giving one of the buttons an action takes the axis away, as the game does with a
   button used twice.
+- `ImproveGamepadSupport`: while the controls setup waits for a button to assign, the pad buttons no longer also
+  work as menu keys, so assigning Y no longer asks whether to go back to the default settings.
 
 ### v1.5
 
